@@ -294,6 +294,163 @@ def quantize_working_set(
     return Image.fromarray(snapped, "RGB")
 
 
+@dataclass
+class PosterizeResult:
+    """Output of :func:`posterize_to_palette`.
+
+    ``image`` is the palette-mapped RGB result (only ``palette`` colors);
+    ``index_map`` is the (H, W) uint8 per-pixel palette-row index;
+    ``stats`` carries the reduction telemetry: the distinct per-channel level
+    counts before/after posterization, the number of pixels whose mapped
+    palette index differs between the direct and posterized inputs, and the
+    parameters used.
+    """
+
+    image: Image.Image
+    index_map: np.ndarray
+    stats: dict
+
+
+def _check_levels(levels: int) -> int:
+    """Validate the per-channel posterization level count ``levels``.
+
+    An int in [2, 256] is required: one level would be a solid color (no
+    tonal separation at all) and 8-bit channels cannot express more than 256
+    distinct steps. Booleans are rejected rather than silently treated as
+    0/1, and non-integers are rejected outright.
+    """
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise ValueError(
+            f"posterization levels must be an int in [2, 256], got {levels!r}"
+        )
+    if levels < 2 or levels > 256:
+        raise ValueError(
+            f"posterization levels must be an int in [2, 256], got {levels}"
+        )
+    return levels
+
+
+def posterize(image: Image.Image, levels: int, dither: str = "none") -> Image.Image:
+    """Coarse pixel-art posterization: quantize every RGB channel to ``levels``.
+
+    Each 8-bit channel is reduced to exactly ``levels`` evenly spaced steps
+    spanning 0..255. A channel value ``c`` maps to step
+    ``floor(c * levels / 256)`` (clamped to ``levels - 1``) and is expanded
+    back to the step's representative 8-bit value
+    ``round(step * 255 / (levels - 1))`` -- so 0 stays 0 and 255 stays 255.
+    With ``dither="bayer"`` the same 4x4 ordered Bayer matrix used by the
+    indexing stages is applied as a *pre-pass*: the fractional position of
+    each channel within its target step is compared against the pixel's
+    absolute-coordinate Bayer threshold and the step is rounded up when it
+    exceeds it. Ordered (not error-diffusion) dithering keeps the output
+    position-stable and deterministic. ``levels`` must be an int in
+    [2, 256]; anything else raises ValueError. Returns an RGB PIL image.
+    """
+    levels = _check_levels(levels)
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    channels = arr.astype(np.float64)
+
+    step = np.floor(channels * levels / 256.0)
+    step = np.clip(step, 0, levels - 1)
+    if dither == "bayer":
+        # Fractional part of the unclamped per-channel position; pushing the
+        # step up one level where it exceeds the Bayer threshold spreads
+        # posterization boundaries into a regular ordered pattern.
+        position = channels * levels / 256.0
+        frac = position - np.floor(position)
+        h, w = arr.shape[:2]
+        yy = np.arange(h)[:, None]
+        xx = np.arange(w)[None, :]
+        thresh = BAYER4[yy % 4, xx % 4][:, :, None]
+        step = np.clip(step + (frac > thresh), 0, levels - 1)
+
+    expanded = np.round(step * 255.0 / (levels - 1))
+    return Image.fromarray(expanded.astype(np.uint8), "RGB")
+
+
+def posterize_to_palette(
+    image: Image.Image,
+    levels: int,
+    palette: np.ndarray,
+    dither: str = "none",
+) -> PosterizeResult:
+    """Posterize to ``levels`` per channel, then map onto an existing palette.
+
+    The "coarser pixel" front end (:func:`posterize`, with the optional Bayer
+    dither pre-pass) reduces every channel to ``levels`` steps; the posterized
+    pixels are then snapped to the nearest row of ``palette`` (Euclidean
+    distance in CIELAB, matching the pipeline's other nearest-color mappings),
+    so the output contains only colors the palette already defines.
+
+    ``palette`` is any array of RGB rows (e.g. a (p, 4, 3) GBImage palette
+    stack or an (N, 3) flat list); duplicate rows are deduplicated and the
+    returned ``index_map`` addresses the deduplicated rows in sorted order.
+    Telemetry in ``stats``:
+
+    * ``levels_before`` / ``levels_after`` -- distinct per-channel level
+      counts (averaged across R, G, B) before and after posterization;
+    * ``index_pixels_changed`` -- pixels whose palette index for the
+      posterized input differs from the index the ORIGINAL input maps to,
+      i.e. the footprint posterization leaves on the index map;
+    * ``levels`` and ``dither`` -- the parameters used.
+
+    The mapping is fully deterministic, so two calls with identical arguments
+    return byte-identical images and index maps. Invalid ``levels`` raises
+    ValueError (see :func:`posterize`).
+    """
+    levels = _check_levels(levels)
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+
+    rgb = image.convert("RGB")
+    orig_arr = np.asarray(rgb, dtype=np.uint8)
+    pal = np.unique(
+        np.asarray(palette, dtype=np.uint8).reshape(-1, 3), axis=0
+    )
+    if pal.shape[0] == 0:
+        raise ValueError("palette must contain at least one RGB color")
+
+    post_img = posterize(rgb, levels, dither)
+    post_arr = np.asarray(post_img, dtype=np.uint8)
+
+    def map_indices(px: np.ndarray) -> np.ndarray:
+        h, w = px.shape[:2]
+        flat = px.reshape(-1, 3)
+        uq, inv = np.unique(flat, axis=0, return_inverse=True)
+        nearest = _nearest_indices(_rgb_to_lab(uq), _rgb_to_lab(pal))
+        return nearest[inv].reshape(h, w).astype(np.uint8)
+
+    post_idx = map_indices(post_arr)
+    base_idx = map_indices(orig_arr)
+    changed = int(np.count_nonzero(post_idx != base_idx))
+
+    before_per = np.array(
+        [np.unique(orig_arr[:, :, c]).shape[0] for c in range(3)], dtype=np.int64
+    )
+    after_per = np.array(
+        [np.unique(post_arr[:, :, c]).shape[0] for c in range(3)], dtype=np.int64
+    )
+
+    mapped = pal[post_idx]
+    stats = {
+        "levels": levels,
+        "dither": dither,
+        "levels_before": float(before_per.mean()),
+        "levels_after": float(after_per.mean()),
+        "levels_before_per_channel": before_per,
+        "levels_after_per_channel": after_per,
+        "index_pixels_changed": changed,
+    }
+    return PosterizeResult(
+        image=Image.fromarray(mapped.astype(np.uint8), "RGB"),
+        index_map=post_idx,
+        stats=stats,
+    )
+
+
 def count_palette_colors(palettes: np.ndarray) -> int:
     """Number of distinct colors across all of a (p, 4, 3) palette stack."""
     pals = np.asarray(palettes, dtype=np.uint8).reshape(-1, 3)
