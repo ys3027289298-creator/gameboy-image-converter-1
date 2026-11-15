@@ -1880,3 +1880,260 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# 4-step green-ramp dithering: quantize to 4 levels, then allocate the levels
+# with ordered (Bayer) or error-diffusion (Floyd-Steinberg) dithering, and
+# finally map them onto the 4-shade green palette. Pure functions over numpy
+# arrays / PIL images; fully deterministic and independent of the hardware
+# conversion path above (no existing function calls into this section).
+# ---------------------------------------------------------------------------
+
+GREEN_DITHER_METHODS = ("bayer", "fs")
+
+
+@dataclass
+class GreenDitherResult:
+    """Outputs and quality metrics for :func:`dither_green_ramp`.
+
+    ``levels`` is the (H, W) uint8 level map (0 == lightest ramp slot);
+    ``image`` is the ramp-rendered RGB image. The metric fields are the four
+    reported data groups: level distribution, mean-luminance bias, error vs
+    direct quantization, and same-parameter repeat consistency.
+    """
+
+    method: str
+    strength: float
+    levels: np.ndarray
+    image: Image.Image
+    level_counts: tuple            # pixels per level 0..3 (lightest..darkest)
+    level_distribution: tuple      # fraction of pixels per level 0..3
+    mean_luma_before: float        # source mean luminance (0..255 scale)
+    mean_luma_after: float         # output mean luminance, same scale
+    mean_luma_bias: float          # mean(output - source); signed
+    mean_abs_luma_bias: float      # mean |output - source|
+    mae: float                     # dithered output MAE vs source luminance
+    rmse: float                    # dithered output RMSE vs source luminance
+    direct_mae: float              # direct (undithered) quantization MAE
+    direct_rmse: float             # direct (undithered) quantization RMSE
+    mae_delta_vs_direct: float     # mae - direct_mae (<= 0 means improvement)
+    rmse_delta_vs_direct: float
+    repeat_pixel_mismatches: int   # differing pixels on an identical re-run
+    consistent: bool               # True iff the re-run is pixel-identical
+
+
+def _validate_green_dither_args(image, method, strength, ramp):
+    if not isinstance(image, Image.Image):
+        raise TypeError(
+            f"image must be a PIL Image.Image, got {type(image).__name__!r}"
+        )
+    if method not in GREEN_DITHER_METHODS:
+        raise ValueError(
+            f"unknown dither method: {method!r}; "
+            f"expected one of {GREEN_DITHER_METHODS}"
+        )
+    # bool is a subclass of int -- reject it explicitly so True/False cannot
+    # silently masquerade as a strength.
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        raise TypeError(
+            f"strength must be a real number, got {type(strength).__name__!r}"
+        )
+    strength = float(strength)
+    if not np.isfinite(strength) or not (0.0 <= strength <= 1.0):
+        raise ValueError(
+            f"strength must be within [0.0, 1.0], got {strength!r}"
+        )
+    if ramp is None:
+        ramp_arr = DMG_RAMP
+    else:
+        try:
+            ramp_arr = np.asarray(ramp, dtype=np.uint8)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("ramp must be an array-like of RGB colors") from exc
+        if ramp_arr.ndim != 2 or ramp_arr.shape[1] != 3 or ramp_arr.shape[0] != 4:
+            raise ValueError(
+                f"ramp must have shape (4, 3), got {tuple(ramp_arr.shape)}"
+            )
+    return method, strength, np.asarray(ramp_arr, dtype=np.uint8)
+
+
+def _nearest_level(values, reps):
+    """Nearest ramp level for every entry of an (...,) luma array.
+
+    Distance to the four level representatives measured vectorized; ties
+    resolve to the lighter level via a stable argmin over ascending levels.
+    """
+    delta = np.abs(values[..., None] - reps[None, :])
+    return np.argmin(delta, axis=-1).astype(np.int16)
+
+
+def _direct_green_levels(source_luma, reps):
+    """Step 1/3: direct 4-level quantization (nearest ramp luminance)."""
+    return _nearest_level(source_luma, reps)
+
+
+def _bayer_green_levels(source_luma, reps, strength):
+    """4x4 ordered-dither level allocation in ramp-luminance space.
+
+    A pixel starts at its nearest ramp level ``k``. It promotes to the
+    darker neighbour when it lies above the k/(k+1) midpoint boundary by
+    more than the Bayer-shifted half-gap, and demotes to the lighter
+    neighbour when it lies below the (k-1)/k boundary by the same shifted
+    amount. The shift is ``bayer * strength * gap``, with the 4x4 Bayer
+    cell centered at zero (range [-0.5, 0.4375]). At strength 0 the shift
+    is zero and neither rule can move a correctly-nearest pixel, so the
+    result equals direct quantization; at strength 1 the boundary sweeps a
+    full half-step, giving the classic ordered pattern that breaks smooth
+    gradients into fine 4x4 texture. Anchored to absolute pixel
+    coordinates, so it is position-stable.
+    """
+    h, w = source_luma.shape
+    nearest = _nearest_level(source_luma, reps)
+    # A degenerate (single-tone) image must collapse to one ramp level: the
+    # ordered threshold is position-dependent and would otherwise split a
+    # uniform field that happens to sit near a level boundary.
+    if float(np.ptp(source_luma)) < 1e-12:
+        return nearest.astype(np.int16)
+    # midpoints[k] is the boundary between levels k and k+1 (k = 0, 1, 2);
+    # gaps[k] is the full spacing across that boundary.
+    midpoints = (reps[:-1] + reps[1:]) / 2.0
+    gaps = np.abs(reps[1:] - reps[:-1])
+    yy = np.arange(h)[:, None]
+    xx = np.arange(w)[None, :]
+    bayer = (BAYER4[yy % 4, xx % 4] - 0.5) * strength
+
+    level = nearest.copy()
+
+    # Promotion (darker, k -> k+1): boundary index k. A positive Bayer cell
+    # relaxes the threshold downward (promotes more readily); a negative one
+    # tightens it.
+    upper_idx = np.clip(nearest, 0, 2)
+    upper_boundary = midpoints[upper_idx] - bayer * gaps[upper_idx]
+    promote = (nearest <= 2) & (source_luma < upper_boundary)
+    level = np.where(promote, nearest + 1, level)
+
+    # Demotion (lighter, k -> k-1): boundary index k-1. Same shifted
+    # threshold; a pixel strictly below it takes the lighter neighbour.
+    lower_idx = np.clip(nearest - 1, 0, 2)
+    lower_boundary = midpoints[lower_idx] - bayer * gaps[lower_idx]
+    demote = (nearest >= 1) & (source_luma > lower_boundary)
+    level = np.where(demote, nearest - 1, level)
+    return np.clip(level, 0, 3).astype(np.int16)
+
+
+def _fs_green_levels(source_luma, reps, strength):
+    """Floyd-Steinberg error-diffusion level allocation (raster order).
+
+    Every pixel snaps to the nearest of the four ramp luminances and its
+    residual is pushed to the four classic neighbours (7/16, 3/16, 5/16,
+    1/16) scaled by ``strength``; strength 0 propagates nothing and therefore
+    equals direct quantization. Sequential and free of any randomness, so
+    identical inputs reproduce bit-for-bit.
+    """
+    h, w = source_luma.shape
+    # Uniform input has no tonal range to diffuse: short-circuit to the
+    # direct nearest level so a flat field cannot develop diffusion worms.
+    if float(np.ptp(source_luma)) < 1e-12:
+        return _nearest_level(source_luma, reps)
+    work = source_luma.astype(np.float64).copy()
+    levels = np.zeros((h, w), dtype=np.int16)
+    for y in range(h):
+        for x in range(w):
+            value = work[y, x]
+            level = int(np.argmin(np.abs(reps - value)))
+            levels[y, x] = level
+            residual = (value - reps[level]) * strength
+            if x + 1 < w:
+                work[y, x + 1] += residual * (7.0 / 16.0)
+            if y + 1 < h:
+                if x > 0:
+                    work[y + 1, x - 1] += residual * (3.0 / 16.0)
+                work[y + 1, x] += residual * (5.0 / 16.0)
+                if x + 1 < w:
+                    work[y + 1, x + 1] += residual * (1.0 / 16.0)
+    return levels
+
+
+def _luma_error(source_luma, levels, ramp_luma):
+    """Mean bias / MAE / RMSE of a ramp-rendered level map vs source."""
+    output_luma = ramp_luma[levels]
+    diff = output_luma - source_luma
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(np.mean(diff * diff)))
+    return output_luma, float(np.mean(diff)), mae, rmse
+
+
+def dither_green_ramp(image, method="bayer", strength=1.0, ramp=None):
+    """Quantize to 4 levels, dither, and map onto a 4-shade green palette.
+
+    The pipeline is: luminance (2126*R + 7152*G + 722*B / 10000, on a 0..255
+    scale) of every source pixel is directly quantized to the nearest of the
+    ramp's four shade luminances (step 1); the level allocation is then
+    re-assigned either by 4x4 ordered dithering (``method="bayer"``) or by
+    Floyd-Steinberg error diffusion (``method="fs"``), with ``strength`` in
+    [0.0, 1.0] blending from plain quantization (0) to full dithering (1)
+    (step 2); finally every level maps to its ramp shade (step 3, defaults to
+    ``DMG_RAMP``, lightest first). Returns a :class:`GreenDitherResult`
+    carrying the level map, the ramp-only RGB image, and the four metric
+    groups (level distribution, mean-luminance bias, error vs direct
+    quantization, repeat consistency).
+
+    Raises:
+        TypeError: ``image`` is not a PIL image, ``strength`` is not numeric,
+            or ``ramp`` is not array-like RGB data.
+        ValueError: unknown ``method``, ``strength`` outside [0, 1], a
+            non-(4, 3) ``ramp``, or an image with no pixels.
+    """
+    method, strength, ramp_arr = _validate_green_dither_args(
+        image, method, strength, ramp
+    )
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[0] == 0 or rgb.shape[1] == 0:
+        raise ValueError("image must contain at least one pixel")
+
+    source_luma = _pixel_luminance(rgb) / 10000.0
+    ramp_luma = _pixel_luminance(ramp_arr) / 10000.0
+    direct_levels = _direct_green_levels(source_luma, ramp_luma)
+
+    if method == "bayer":
+        def allocate(luma, amount):
+            return _bayer_green_levels(luma, ramp_luma, amount)
+    else:
+        def allocate(luma, amount):
+            return _fs_green_levels(luma, ramp_luma, amount)
+    levels = allocate(source_luma, strength)
+    repeat_levels = allocate(source_luma, strength)
+
+    mismatches = int(np.count_nonzero(levels != repeat_levels))
+    output_rgb = ramp_arr[levels]
+
+    counts = np.bincount(levels.reshape(-1), minlength=4)
+    total = float(counts.sum())
+    output_luma, bias, mae, rmse = _luma_error(
+        source_luma, levels, ramp_luma
+    )
+    _, _, direct_mae, direct_rmse = _luma_error(
+        source_luma, direct_levels, ramp_luma
+    )
+
+    return GreenDitherResult(
+        method=method,
+        strength=strength,
+        levels=levels.astype(np.uint8),
+        image=Image.fromarray(output_rgb, "RGB"),
+        level_counts=tuple(int(c) for c in counts),
+        level_distribution=tuple(float(c / total) for c in counts),
+        mean_luma_before=float(np.mean(source_luma)),
+        mean_luma_after=float(np.mean(output_luma)),
+        mean_luma_bias=bias,
+        mean_abs_luma_bias=float(np.mean(np.abs(output_luma - source_luma))),
+        mae=mae,
+        rmse=rmse,
+        direct_mae=direct_mae,
+        direct_rmse=direct_rmse,
+        mae_delta_vs_direct=mae - direct_mae,
+        rmse_delta_vs_direct=rmse - direct_rmse,
+        repeat_pixel_mismatches=mismatches,
+        consistent=mismatches == 0,
+    )
