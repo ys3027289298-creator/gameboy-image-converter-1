@@ -755,6 +755,22 @@ def index_tiles(
 ) -> GBImage:
     """Render each 8x8 tile against its assigned palette -> index patterns.
 
+    Thin public wrapper over ``_index_tiles_impl`` with a (0, 0) Bayer anchor;
+    the chunked converter calls the impl directly with the block's absolute
+    canvas offset.
+    """
+    return _index_tiles_impl(image, palettes, assignment, dither, origin=(0, 0))
+
+
+def _index_tiles_impl(
+    image: np.ndarray,
+    palettes: np.ndarray,
+    assignment: np.ndarray,
+    dither: str = "none",
+    origin: tuple = (0, 0),
+) -> GBImage:
+    """Render each 8x8 tile against its assigned palette -> index patterns.
+
     ``image`` is (H, W, 3) uint8 (any RGB content; typically the original
     post-crop pixels -- palette assignment is computed from the quantized
     working set, but per-pixel indexing/dithering is most faithful from the
@@ -864,8 +880,14 @@ def index_tiles(
     if dither == "bayer":
         i2_px = idx2_t[inv2d, pid_px]
         t_px = tval_t[inv2d, pid_px]
-        yy = np.arange(h)[:, None]
-        xx = np.arange(w)[None, :]
+        # Anchor the Bayer threshold to the pixel's ABSOLUTE image coordinates
+        # even when ``image`` is a sub-block of a larger canvas (chunked
+        # processing): origin is the (row, col) offset of this block's top-left
+        # pixel in the full image. Default (0, 0) reproduces the original
+        # whole-image math exactly.
+        oy, ox = int(origin[0]), int(origin[1])
+        yy = np.arange(h)[:, None] + oy
+        xx = np.arange(w)[None, :] + ox
         thresh = BAYER4[yy % 4, xx % 4]
         index = np.where(t_px > thresh, i2_px, i1_px)
     else:
@@ -1468,17 +1490,42 @@ def verify_roundtrip(png: Image.Image, preset: Preset, expected: GBImage) -> int
 
 
 def _index_tiles_mono(
-    image: np.ndarray, palettes: np.ndarray, dither: str = "none"
+    image: np.ndarray, palettes: np.ndarray, dither: str = "none",
 ) -> GBImage:
     """Index pixels to the mono ramp by contrast-stretched luminance (Stage 4, mono).
 
-    ``image`` is the ORIGINAL (post-crop/resize) RGB array -- mono deliberately
-    skips the working-set quantizer so ordered dithering sees continuous tone.
-    Pixel luminance is percentile-stretched (1st..99th -> 0..1) and quantized to
-    the 4 ramp levels evenly: x = lum_n * 3, base = floor(x), and the pixel
-    takes ``base + 1`` iff the fractional part exceeds the threshold (0.5 when
-    dither="none", else the absolute-coordinate 4x4 Bayer threshold). Ramp
-    index 0 is lightest, so the stored index is ``3 - level``.
+    Public wrapper (original signature preserved): the contrast-stretch
+    percentiles are computed from this image's own luminance and the Bayer
+    anchor is the image origin. The chunked converter calls
+    ``_index_tiles_mono_impl`` with the FULL image's precomputed (lo, hi) and
+    absolute block offset so every block shares one global stretch (identical
+    output to a whole-image conversion).
+    """
+    arr = np.asarray(image, dtype=np.uint8)
+    lum = _pixel_luminance(arr)
+    lo, hi = np.percentile(lum, [1.0, 99.0])
+    return _index_tiles_mono_impl(
+        image, palettes, dither, origin=(0, 0), stretch=(float(lo), float(hi))
+    )
+
+
+def _index_tiles_mono_impl(
+    image: np.ndarray,
+    palettes: np.ndarray,
+    dither: str = "none",
+    origin: tuple = (0, 0),
+    stretch: tuple | None = None,
+) -> GBImage:
+    """Mono indexing with an externally supplied global contrast stretch.
+
+    ``stretch`` is ``(lo, hi)`` -- the 1st/99th luminance percentiles measured
+    over the WHOLE canvas; when ``None`` they are derived from this block
+    (whole-image behavior). Pixel luminance is percentile-stretched
+    (1st..99th -> 0..1) and quantized to the 4 ramp levels evenly:
+    x = lum_n * 3, base = floor(x), and the pixel takes ``base + 1`` iff the
+    fractional part exceeds the threshold (0.5 when dither="none", else the
+    absolute-coordinate 4x4 Bayer threshold). Ramp index 0 is lightest, so the
+    stored index is ``3 - level``.
     """
     if dither not in ("none", "bayer"):
         raise ValueError(f"unknown dither mode: {dither!r}")
@@ -1489,7 +1536,10 @@ def _index_tiles_mono(
     ramp = np.asarray(palettes, dtype=np.uint8)[0]  # (4, 3), lightest first
 
     lum = _pixel_luminance(arr)  # (h, w) float
-    lo, hi = np.percentile(lum, [1.0, 99.0])
+    if stretch is None:
+        lo, hi = np.percentile(lum, [1.0, 99.0])
+    else:
+        lo, hi = float(stretch[0]), float(stretch[1])
     degenerate = hi - lo < 1e-9
     if degenerate:
         lum_n = np.full_like(lum, 0.5, dtype=np.float64)
@@ -1503,8 +1553,11 @@ def _index_tiles_mono(
     # ordered-dither threshold straddles frac=0.5 and would split it, so fall
     # back to plain rounding when there is no tonal range to dither.
     if dither == "bayer" and not degenerate:
-        yy = np.arange(h)[:, None]
-        xx = np.arange(w)[None, :]
+        # Absolute-coordinate anchor (see ``index_tiles``): a sub-block chunk
+        # of a larger canvas keeps the full image's Bayer phase.
+        oy, ox = int(origin[0]), int(origin[1])
+        yy = np.arange(h)[:, None] + oy
+        xx = np.arange(w)[None, :] + ox
         thresh = BAYER4[yy % 4, xx % 4]
     else:
         thresh = 0.5
@@ -1869,6 +1922,425 @@ def convert_for_hardware(
             # Safety net (not expected to be reachable): the fallback ladder
             # could not reach a GB-legal import; keep today's honest warning
             # rather than ship a false guarantee.
+            gs_stats = gb_studio_import.gbstudio_color_stats(cr.image)
+            gs_warnings, _ = gb_studio_import.gbstudio_report(gs_stats, budget)
+            warnings.extend(gs_warnings)
+
+    return ConversionResult(
+        image=final_img,
+        reference=reference_img,
+        stats=stats,
+        warnings=warnings,
+        palette_hex=_palette_hex(final_gb.palettes),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunked conversion -- bounded-memory path for oversized source images
+# ---------------------------------------------------------------------------
+#
+# The regular pipeline (``convert_for_hardware``) holds the full-resolution
+# working set, its Lab unique-color tables, and the per-pixel index images all
+# at once. For a very large source that exceeds the available memory even
+# though its *hardware* output is small, this section adds a chunked path:
+#
+#   1. Global palette decision (quantize -> pack -> per-tile assignment) runs
+#      once over the whole image, so every block shares ONE palette set --
+#      colors can never drift between blocks.
+#   2. The expensive, per-pixel stage (index/dither) runs on one rectangular
+#      block of tile cells at a time; each block's patterns are written into
+#      a preallocated full-size (but index-sized, 1 byte/pixel) output grid.
+#   3. Optional block overlap (a multiple of 8 pixels) extends each block past
+#      its ownership boundary; the overlap rows/columns are computed and then
+#      discarded, so neighbors always index the same pixels under the same
+#      global palettes regardless of where a block edge lands.
+#
+# All block-local dithering is anchored to the pixel's ABSOLUTE canvas
+# coordinates (``origin`` on the index impls), so a block produces exactly the
+# pixels the whole-image path would have produced at those coordinates -- the
+# stitched output is pixel-identical to a whole-image conversion.
+
+# Defaults for the public chunked entry point (tile cells of 8x8 pixels).
+DEFAULT_CHUNK_TILES = 8          # 8x8 cells => 64x64-pixel blocks
+DEFAULT_CHUNK_OVERLAP_TILES = 0
+
+
+def _validate_chunk_grid(
+    chunk_w: int,
+    chunk_h: int,
+    overlap_w: int,
+    overlap_h: int,
+    tw: int,
+    th: int,
+) -> tuple:
+    """Validate block/overlap sizes (in PIXELS) against an tw x th tile grid.
+
+    Sizes must be positive, multiples of 8 (the hardware tile), and the
+    overlap on each axis must be strictly smaller than the block size so at
+    least one non-overlapping column/row of pixels remains per block. Returns
+    the (block-cell, overlap-cell) sizes as tile counts ``(cw_t, ch_t,
+    ow_t, oh_t)``. Raises ``ValueError`` with an actionable message otherwise.
+    """
+    for name, value in (
+        ("chunk_w", chunk_w), ("chunk_h", chunk_h),
+        ("overlap_w", overlap_w), ("overlap_h", overlap_h),
+    ):
+        # Exact integer type only: bool is an int subclass but never a size,
+        # and a float (even 16.0) would silently truncate -- reject both with
+        # an actionable message rather than coercing.
+        if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+            raise ValueError(
+                f"{name} must be an integer number of pixels, got "
+                f"{type(value).__name__} {value!r}"
+            )
+        if int(value) < 0:
+            raise ValueError(f"{name} must be >= 0 pixels, got {int(value)}")
+        if int(value) % 8 != 0:
+            raise ValueError(f"{name} must be a multiple of 8 pixels, got {int(value)}")
+    for name, value in (("chunk_w", chunk_w), ("chunk_h", chunk_h)):
+        if int(value) < 1:
+            raise ValueError(f"{name} must be >= 1 pixel, got {int(value)}")
+
+    cw_t, ch_t = int(chunk_w) // 8, int(chunk_h) // 8
+    ow_t, oh_t = int(overlap_w) // 8, int(overlap_h) // 8
+    if ow_t >= cw_t:
+        raise ValueError(
+            f"overlap_w ({int(overlap_w)}px) must be smaller than "
+            f"chunk_w ({int(chunk_w)}px)"
+        )
+    if oh_t >= ch_t:
+        raise ValueError(
+            f"overlap_h ({int(overlap_h)}px) must be smaller than "
+            f"chunk_h ({int(chunk_h)}px)"
+        )
+    # Defensive: a caller passing a zero-sized canvas gets the same error the
+    # whole-image path raises rather than an empty grid.
+    if tw < 1 or th < 1:
+        raise ValueError("image is smaller than one 8x8 tile")
+    return cw_t, ch_t, ow_t, oh_t
+
+
+def _iter_chunk_windows(tw: int, th: int, cw_t: int, ch_t: int,
+                        ow_t: int, oh_t: int):
+    """Yield block windows over a tw x th tile grid as tile-cell rectangles.
+
+    Each window is ``(r0, c0, r1, c1, own_r0, own_c0, own_r1, own_c1)``:
+    the *processed* rectangle [r0:r1, c0:c1] is extended by the overlap on
+    every side (clamped to the grid), while the *ownership* rectangle
+    [own_r0:own_r1, own_c0:own_c1] is the disjoint, in-order piece of the
+    grid this block is responsible for stitching back. Ownership rectangles
+    partition the grid in raster order, so concatenating them reproduces the
+    whole image exactly.
+    """
+    for own_r0 in range(0, th, ch_t):
+        own_r1 = min(own_r0 + ch_t, th)
+        for own_c0 in range(0, tw, cw_t):
+            own_c1 = min(own_c0 + cw_t, tw)
+            r0 = max(0, own_r0 - oh_t)
+            r1 = min(th, own_r1 + oh_t)
+            c0 = max(0, own_c0 - ow_t)
+            c1 = min(tw, own_c1 + ow_t)
+            yield (r0, c0, r1, c1, own_r0, own_c0, own_r1, own_c1)
+
+
+def _pack_stage_chunked(
+    orig_arr: np.ndarray,
+    img: Image.Image,
+    ps: "Preset",
+    n_palettes: int,
+    custom_palette: np.ndarray | None,
+    color_cap: int | None,
+    dither: str,
+    cw_t: int,
+    ch_t: int,
+    ow_t: int,
+    oh_t: int,
+    mono_ramp: np.ndarray | None = None,
+):
+    """Build the pre-merge GBImage with the index/dither stage chunked.
+
+    Quantization and palette packing are GLOBAL (identical math to the
+    whole-image path); only ``index_tiles`` / ``_index_tiles_mono`` runs per
+    block. The returned GBImage is assembled in raster order and is exactly
+    what the whole-image ``pack_stage`` would have returned, including the
+    optional lossless dedup.
+    """
+    h, w = orig_arr.shape[:2]
+    th, tw = h // 8, w // 8
+    n_tiles = th * tw
+
+    if ps.mono:
+        ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
+        pals, assignment = pack_palettes_mono(orig_arr, ramp)
+        # The mono contrast stretch is a GLOBAL statistic: compute the 1st/99th
+        # luminance percentiles once over the full canvas and hand them to each
+        # block, so a block's ramp levels match the whole-image conversion
+        # exactly instead of re-stretching to its own local tonal range.
+        full_lum = _pixel_luminance(orig_arr)
+        lo, hi = np.percentile(full_lum, [1.0, 99.0])
+        mono_stretch = (float(lo), float(hi))
+        del full_lum
+    else:
+        quantized = quantize_working_set(
+            img, min(4 * n_palettes * WORKING_SET_FACTOR, 128), custom_palette
+        )
+        a = np.asarray(quantized, dtype=np.uint8)
+        pals, assignment = pack_palettes(a, n_palettes, custom_palette)
+        if color_cap is not None:
+            pals = cap_palette_colors(
+                pals, a, color_cap, allow_new_colors=custom_palette is None
+            )
+
+    # Output tile grids: one pattern slot per cell (raster order), identity
+    # tilemap, no flips -- the same shape the whole-image indexers return.
+    patterns = np.empty((n_tiles, 8, 8), dtype=np.uint8)
+    for (r0, c0, r1, c1, own_r0, own_c0, own_r1, own_c1) in _iter_chunk_windows(
+        tw, th, cw_t, ch_t, ow_t, oh_t
+    ):
+        block_arr = orig_arr[r0 * 8:r1 * 8, c0 * 8:c1 * 8]
+        block_assign = assignment[r0:r1, c0:c1]
+        if ps.mono:
+            block_gb = _index_tiles_mono_impl(
+                block_arr, pals, dither, origin=(r0 * 8, c0 * 8),
+                stretch=mono_stretch,
+            )
+        else:
+            block_gb = _index_tiles_impl(
+                block_arr, pals, block_assign, dither,
+                origin=(r0 * 8, c0 * 8),
+            )
+        # The block's patterns are in its own local raster order; pull out the
+        # rows belonging to the ownership rectangle and place them globally.
+        bh_t, bw_t = r1 - r0, c1 - c0
+        block_patterns = block_gb.patterns.reshape(bh_t, bw_t, 8, 8)
+        keep = block_patterns[
+            own_r0 - r0:own_r1 - r0,
+            own_c0 - c0:own_c1 - c0,
+        ]
+        for lr, gr in enumerate(range(own_r0, own_r1)):
+            slot0 = gr * tw + own_c0
+            patterns[slot0:slot0 + (own_c1 - own_c0)] = keep[lr]
+
+    g = GBImage(
+        patterns=patterns,
+        tilemap=np.arange(n_tiles, dtype=np.int32).reshape(th, tw),
+        attrs_palette=assignment.astype(np.uint8),
+        attrs_hflip=np.zeros((th, tw), dtype=bool),
+        attrs_vflip=np.zeros((th, tw), dtype=bool),
+        palettes=pals,
+    )
+    if ps.fixed_size is None:
+        g = dedup_patterns(g, ps.allow_flips)
+    return g
+
+
+def convert_for_hardware_chunked(
+    image: Image.Image,
+    preset: str,
+    *,
+    tile_budget: int | None = None,
+    reserve_ui_palette: bool = True,
+    dither: str = "none",
+    custom_palette: np.ndarray | None = None,
+    mono_ramp: np.ndarray | None = None,
+    max_colors: int | None = None,
+    chunk_size: tuple = (DEFAULT_CHUNK_TILES * 8, DEFAULT_CHUNK_TILES * 8),
+    chunk_overlap: tuple = (
+        DEFAULT_CHUNK_OVERLAP_TILES * 8,
+        DEFAULT_CHUNK_OVERLAP_TILES * 8,
+    ),
+) -> ConversionResult:
+    """Bounded-memory equivalent of ``convert_for_hardware`` for large images.
+
+    Splits the per-pixel indexing/dithering work into rectangular blocks of
+    ``chunk_size`` pixels (``(width, height)``, each a positive multiple of 8),
+    optionally extended by ``chunk_overlap`` pixels on every side (also
+    multiples of 8, each strictly smaller than its block dimension). The
+    palette decision (working-set quantization, palette packing, per-tile
+    assignment) is computed ONCE over the whole image and shared by every
+    block, so colors stay consistent across block boundaries, and every block
+    anchors its dither threshold to absolute canvas coordinates. The stitched
+    result is therefore pixel-identical to ``convert_for_hardware`` with the
+    same arguments, while the largest transient buffer is one block's Lab
+    table instead of the whole image's.
+
+    Logo presets are fixed-size 160x144 canvases and never need chunking, so
+    they are rejected with ``ValueError``; use ``convert_for_hardware`` for
+    them. Returns the same ``ConversionResult`` as the whole-image entry point.
+    """
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset: {preset!r}")
+    ps = PRESETS[preset]
+    if ps.fixed_size is not None:
+        raise ValueError(
+            f"preset {preset!r} has a fixed canvas size; chunked processing "
+            "is only for large images -- use convert_for_hardware instead"
+        )
+    if dither not in ("none", "bayer"):
+        raise ValueError(f"unknown dither mode: {dither!r}")
+
+    # Validate the raw (uncoerced) tuple values -- shape first so a short
+    # tuple raises a clear error, then the integer/multiple-of-8 rules --
+    # before any int() coercion could hide a float or bool.
+    for label, pair in (("chunk_size", chunk_size), ("chunk_overlap", chunk_overlap)):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError(
+                f"{label} must be a (width, height) pair of integer pixels, "
+                f"got {pair!r}"
+            )
+
+    # --- Identical input preparation to convert_for_hardware ---------------
+    warnings: list = []
+    img = image.convert("RGB")
+    ow, oh = img.size
+    nw, nh = (ow // 8) * 8, (oh // 8) * 8
+    if nw < 1 or nh < 1:
+        raise ValueError("image is smaller than one 8x8 tile")
+    if (nw, nh) != (ow, oh):
+        left = (ow - nw) // 2
+        top = (oh - nh) // 2
+        img = img.crop((left, top, left + nw, top + nh))
+        warnings.append(
+            f"Input center-cropped from {ow}x{oh} to {nw}x{nh} "
+            "(dimensions must be multiples of 8)."
+        )
+
+    tw, th = nw // 8, nh // 8
+    cw_t, ch_t, ow_t, oh_t = _validate_chunk_grid(
+        chunk_size[0], chunk_size[1],
+        chunk_overlap[0], chunk_overlap[1], tw, th,
+    )
+    chunk_w, chunk_h = int(chunk_size[0]), int(chunk_size[1])
+    overlap_w, overlap_h = int(chunk_overlap[0]), int(chunk_overlap[1])
+
+    n_palettes = ps.n_palettes
+    if reserve_ui_palette and not ps.mono and n_palettes >= 8:
+        n_palettes -= 1
+
+    hw_max_colors = 4 * n_palettes
+    color_cap = None
+    if ps.mono:
+        target_colors = None
+    elif max_colors is None:
+        target_colors = hw_max_colors
+    else:
+        target_colors = max(1, int(max_colors))
+        if target_colors > hw_max_colors:
+            if reserve_ui_palette and ps.n_palettes >= 8 and target_colors <= 4 * ps.n_palettes:
+                warnings.append(
+                    f"Requested {target_colors} colors but palette 8 is reserved "
+                    f"for dialogue/UI, so output is capped at {hw_max_colors} "
+                    "(untick the reserve option to use all 32)."
+                )
+            else:
+                warnings.append(
+                    f"Requested {target_colors} colors exceeds this preset's "
+                    f"hardware limit; capped at {hw_max_colors} "
+                    f"({n_palettes} palettes x 4)."
+                )
+            target_colors = hw_max_colors
+        n_palettes = max(1, -(-target_colors // 4))
+        if target_colors < 4 * n_palettes:
+            color_cap = target_colors
+
+    if custom_palette is not None and not ps.mono:
+        k = int(np.unique(
+            snap_rgb555(np.asarray(custom_palette, dtype=np.uint8).reshape(-1, 3)),
+            axis=0).shape[0])
+        if k < target_colors:
+            warnings.append(
+                f"Custom palette restricts output to {k} colors (this preset "
+                f"supports up to {target_colors}). The right pane shows the "
+                "converter's own choices."
+            )
+
+    orig_arr = np.asarray(img, dtype=np.uint8)
+    budget = tile_budget if tile_budget is not None else ps.tile_budget
+
+    # The mono ramp is an explicit argument all the way down -- never mutate
+    # the module-level DMG_RAMP (the hosted app serves concurrent requests on
+    # threads, so a global swap would race other conversions).
+    _pack_cache: dict = {}
+
+    def pack_stage(n_pal):
+        cached = _pack_cache.get(n_pal)
+        if cached is not None:
+            return cached
+        if ps.mono:
+            g = _pack_stage_chunked(
+                orig_arr, img, ps, n_pal, None, None, dither,
+                cw_t, ch_t, ow_t, oh_t, mono_ramp=mono_ramp,
+            )
+        else:
+            g = _pack_stage_chunked(
+                orig_arr, img, ps, n_pal, custom_palette, color_cap, dither,
+                cw_t, ch_t, ow_t, oh_t,
+            )
+        _pack_cache[n_pal] = g
+        return g
+
+    reference_gb = pack_stage(n_palettes)
+    reference_img = render(reference_gb)
+
+    cr = _conform_to_gbstudio(pack_stage, ps, budget, n_palettes)
+    final_gb = cr.gb
+    final_img = Image.fromarray(cr.image, "RGB")
+
+    base_img = Image.fromarray(cr.base_image, "RGB")
+    n_reimport = verify_roundtrip(
+        base_img, replace(ps, n_palettes=n_palettes), final_gb
+    )
+
+    n_merges = cr.n_merges
+    p95 = cr.p95
+
+    if n_merges > 0 and p95 > _HEAVY_MERGE_P95_DELTA_E:
+        warnings.append(
+            f"Heavy tile merging (p95 dE ~ {p95:.1f}): raise the tile budget, "
+            "simplify the image, or disable dithering to reduce quality loss."
+        )
+
+    if not ps.mono and cr.n_pal_final < n_palettes:
+        warnings.append(
+            f"Only {cr.n_pal_final} of {n_palettes} palettes could be used: "
+            "GB Studio's importer needed fewer palettes to import this image "
+            "cleanly, so the output has fewer colors than requested."
+        )
+
+    if budget is not None and cr.tiles > budget:
+        warnings.append(
+            f"Verified tile count {cr.tiles} exceeds the {budget} budget "
+            "after import -- raise the budget or simplify the image."
+        )
+
+    stats = {
+        "tiles_used": n_reimport if budget is None else int(cr.tiles),
+        "tile_budget": budget,
+        "palettes_used": int(final_gb.palettes.shape[0]),
+        "colors_used": count_palette_colors(final_gb.palettes),
+        "colors_target": target_colors,
+        "n_merges": int(n_merges),
+        "p95_delta_e": p95,
+        "preset": ps.name,
+        "dither": dither,
+    }
+
+    if ps.mono:
+        if mono_ramp is not None:
+            buckets = gb_studio_import.mono_ramp_green_buckets(final_gb.palettes[0])
+            if len(set(buckets)) < len(buckets):
+                warnings.append(
+                    "Custom mono ramp has shades sharing a GB Studio green "
+                    "bucket -- those shades will merge on GB Studio import; "
+                    "spread the ramp's green channel across the 65/130/205 "
+                    "thresholds."
+                )
+    else:
+        stats["gbstudio_tiles"] = int(cr.tiles)
+        stats["gbstudio_palettes_extracted"] = int(cr.palettes_extracted)
+        stats["gbstudio_corrupted_tiles"] = int(cr.corrupted_tiles)
+        stats["gbstudio_recolored_tiles"] = int(cr.n_recolored)
+        if cr.exhausted:
             gs_stats = gb_studio_import.gbstudio_color_stats(cr.image)
             gs_warnings, _ = gb_studio_import.gbstudio_report(gs_stats, budget)
             warnings.extend(gs_warnings)
