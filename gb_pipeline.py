@@ -8,6 +8,7 @@ breakdown these functions implement.
 """
 
 import heapq
+import hashlib
 import threading
 from dataclasses import dataclass, replace
 
@@ -1880,3 +1881,306 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Optional three-stage banding reduction (post-processing, opt-in)
+#
+# Three independently switchable stages that smooth visible color banding
+# without touching ``convert_for_hardware`` or any other existing function:
+#   1. quantize -- hard color quantization to a four-level palette
+#   2. dither   -- ordered Bayer allocation between adjacent palette levels
+#   3. tile     -- pad to a multiple of 8 and rearrange into 8x8 tiles
+# Every stage is pure/deterministic (no RNG), so identical parameters always
+# reproduce byte-identical outputs.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BandingResult:
+    """Output of :func:`reduce_banding`.
+
+    ``image`` is the final post-stage RGB uint8 array (H', W', 3), ``tiles``
+    is its 8x8-tile view (n_tiles, 8, 8, 3), and ``stats`` carries the four
+    requested data sets: level distribution, pre/post-dither luminance
+    deviation, aligned size / padding share, and two-run consistency.
+    """
+
+    image: np.ndarray
+    tiles: np.ndarray
+    palette4: np.ndarray  # (4, 3) uint8, luminance-sorted (lightest first)
+    stats: dict
+
+
+def _as_rgb_array(image) -> np.ndarray:
+    """Accept a PIL image or an (..., 3) uint8 array; always return RGB u8."""
+    if isinstance(image, Image.Image):
+        arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    else:
+        arr = np.asarray(image)
+        if arr.dtype != np.uint8:
+            raise TypeError("image array must be uint8")
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError("image array must have shape (H, W, 3)")
+    if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError("image must contain at least one pixel")
+    return arr
+
+
+def _four_level_palette(arr: np.ndarray) -> np.ndarray:
+    """Derive a deterministic four-level RGB palette from an RGB array.
+
+    MEDIANCUT (dither off) supplies up to four representatives; fewer than
+    four distinct input colors yield fewer representatives, in which case the
+    last slot(s) repeat the darkest entry so the result always has exactly
+    four rows. Rows are luminance-sorted lightest-first.
+    """
+    pil = Image.fromarray(arr, "RGB")
+    quant = pil.quantize(
+        colors=4, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+    )
+    full_palette = np.asarray(quant.getpalette(), dtype=np.uint8).reshape(-1, 3)
+    used = np.unique(np.asarray(quant))
+    colors = full_palette[used]
+    colors = np.unique(colors, axis=0)
+    if colors.shape[0] < 4:
+        pad = np.repeat(colors[-1:], 4 - colors.shape[0], axis=0)
+        colors = np.concatenate([colors, pad], axis=0)
+    return luminance_sort(colors[:4]).astype(np.uint8)
+
+
+def _hard_quantize_levels(arr: np.ndarray, palette4: np.ndarray) -> np.ndarray:
+    """Nearest palette level per pixel by luminance -> uint8 level map."""
+    lum = _pixel_luminance(arr)
+    pal_lum = _pixel_luminance(palette4)
+    diff = lum[..., None] - pal_lum[None, None, :]
+    return np.argmin(np.abs(diff), axis=2).astype(np.uint8)
+
+
+def _bayer_levels(arr: np.ndarray, palette4: np.ndarray) -> np.ndarray:
+    """Ordered-dither level assignment between adjacent palette levels.
+
+    Each pixel's luminance is bracketed by the two nearest palette levels
+    (clamped at the ramp ends); the pixel is pushed up one level when its
+    normalized position between them exceeds the 4x4 Bayer threshold at its
+    absolute image coordinates. Position-stable and RNG-free.
+    """
+    h, w = arr.shape[:2]
+    lum = _pixel_luminance(arr)
+    pal_lum = _pixel_luminance(palette4)
+
+    order = np.argsort(pal_lum, kind="stable")
+    levels_sorted = np.asarray(order, dtype=np.int64)
+    lum_sorted = pal_lum[levels_sorted]
+
+    hi = np.searchsorted(lum_sorted, lum, side="left")
+    hi = np.clip(hi, 1, 3)
+    lo = hi - 1
+    lo_lum = lum_sorted[lo]
+    hi_lum = lum_sorted[hi]
+    span = hi_lum - lo_lum
+    t = np.where(span > 0, (lum - lo_lum) / np.where(span > 0, span, 1.0), 0.0)
+    t = np.clip(t, 0.0, 1.0)
+
+    yy = np.arange(h)[:, None]
+    xx = np.arange(w)[None, :]
+    thresh = BAYER4[yy % 4, xx % 4]
+    chosen_sorted = lo + (t > thresh)
+    return levels_sorted[chosen_sorted].astype(np.uint8)
+
+
+def _pad_to_tiles(
+    arr: np.ndarray, tile_size: int, fill: tuple
+) -> tuple:
+    """Pad an (H, W, 3) array so both axes are multiples of ``tile_size``."""
+    h, w = arr.shape[:2]
+    pad_bottom = (-h) % tile_size
+    pad_right = (-w) % tile_size
+    if pad_bottom == 0 and pad_right == 0:
+        return arr, 0, 0
+    padded = np.empty(
+        (h + pad_bottom, w + pad_right, 3), dtype=np.uint8
+    )
+    padded[:h, :w] = arr
+    if pad_bottom:
+        padded[h:, :] = fill
+    if pad_right:
+        padded[:, w:] = fill
+    return padded, pad_bottom, pad_right
+
+
+def _level_distribution(levels: np.ndarray) -> dict:
+    """Pixel counts per level (keys 0..3 always present)."""
+    counts = np.bincount(levels.reshape(-1), minlength=4)
+    return {int(level): int(count) for level, count in enumerate(counts[:4])}
+
+
+def _array_digest(arr: np.ndarray) -> str:
+    """Stable SHA-256 digest (first 16 hex chars) over an array's bytes."""
+    return hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()[:16]
+
+
+def _reduce_banding_once(
+    arr: np.ndarray,
+    quantize: bool,
+    dither: bool,
+    tile: bool,
+    tile_size: int,
+    fill: tuple,
+) -> BandingResult:
+    """Single deterministic pass of the three-stage banding reducer."""
+    h0, w0 = arr.shape[:2]
+
+    # Stages 1-2 need a four-level palette whenever either one is enabled.
+    palette4 = (
+        _four_level_palette(arr) if (quantize or dither)
+        else np.zeros((4, 3), dtype=np.uint8)
+    )
+
+    stats: dict = {}
+    current = arr
+
+    if quantize:
+        hard_levels = _hard_quantize_levels(arr, palette4)
+        hard_rgb = palette4[hard_levels]
+        stats["level_distribution_hard"] = _level_distribution(hard_levels)
+        current = hard_rgb
+
+    if dither:
+        dither_levels = _bayer_levels(arr, palette4)
+        dither_rgb = palette4[dither_levels]
+        stats["level_distribution_dithered"] = _level_distribution(dither_levels)
+        if quantize:
+            # Normalize the codebase's 2126/7152/722 weighted luminance
+            # (0..2,550,000) onto the conventional 0..255 scale so the
+            # reported deviations stay human-interpretable.
+            before = _pixel_luminance(hard_rgb) / 10000.0
+            after = _pixel_luminance(dither_rgb) / 10000.0
+            delta = after - before
+            stats["luminance_deviation"] = {
+                "mean_abs": float(np.mean(np.abs(delta))),
+                "max_abs": float(np.max(np.abs(delta))),
+                "mean_signed": float(np.mean(delta)),
+                "p95_abs": float(np.percentile(np.abs(delta), 95.0)),
+            }
+        else:
+            stats["luminance_deviation"] = None
+        current = dither_rgb
+
+    if tile:
+        # Default padding blends into the darkest palette level so a tiled,
+        # quantized image never gains a fifth color from its border; an
+        # explicit user fill still wins.
+        active_fill = fill if fill is not None else tuple(int(c) for c in palette4[-1])
+        padded, pad_bottom, pad_right = _pad_to_tiles(
+            current, tile_size, active_fill
+        )
+        h2, w2 = padded.shape[:2]
+        th, tw = h2 // tile_size, w2 // tile_size
+        tiles = (
+            padded.reshape(th, tile_size, tw, tile_size, 3)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(th * tw, tile_size, tile_size, 3)
+        )
+        padded_pixels = h2 * w2 - h0 * w0
+        stats["tile_alignment"] = {
+            "original_size": [int(w0), int(h0)],
+            "aligned_size": [int(w2), int(h2)],
+            "tile_grid": [int(th), int(tw)],
+            "pad_right": int(pad_right),
+            "pad_bottom": int(pad_bottom),
+            "padded_pixels": int(padded_pixels),
+            "padding_ratio": float(padded_pixels / (h2 * w2)),
+        }
+        current = padded
+    else:
+        # Stage 3 owns rearrangement/alignment; with it off there is no
+        # guaranteed tile grid, so expose no tiles rather than reshape a
+        # non-divisible buffer.
+        tiles = np.empty((0, tile_size, tile_size, 3), dtype=np.uint8)
+        stats["tile_alignment"] = None
+
+    stats["switches"] = {
+        "quantize": bool(quantize),
+        "dither": bool(dither),
+        "tile": bool(tile),
+    }
+    stats["output_digest"] = _array_digest(current)
+    return BandingResult(
+        image=current, tiles=tiles, palette4=palette4, stats=stats
+    )
+
+
+def reduce_banding(
+    image,
+    *,
+    quantize: bool = True,
+    dither: bool = True,
+    tile: bool = True,
+    tile_size: int = 8,
+    fill: tuple | None = None,
+) -> BandingResult:
+    """Reduce visible color banding in three independently switchable stages.
+
+    Stage 1 (``quantize``): hard-quantize every pixel to a four-level
+    palette (MEDIANCUT-derived, luminance-sorted), eliminating fine color
+    steps in favor of explicit levels.
+    Stage 2 (``dither``): replace the hard assignment with an ordered 4x4
+    Bayer allocation between adjacent palette levels, breaking up flat
+    bands while keeping the same four colors. With ``quantize`` also on,
+    ``stats['luminance_deviation']`` measures the pre/post-dither change.
+    Stage 3 (``tile``): right/bottom-pad the image to a multiple of
+    ``tile_size`` (default 8) with ``fill`` (defaulting to the darkest
+    palette level after stages 1-2, else black) and rearrange the pixels into
+    (n, tile_size, tile_size, 3) tiles; alignment and padding share are
+    reported in ``stats['tile_alignment']``.
+
+    The stages are independent switches: quantize-only gives a flat four
+    color posterization, dither-only keeps the Bayer output, and with both
+    off the pixels pass through untouched. Every stage is RNG-free and the
+    whole function is run twice internally to verify same-parameter
+    consistency (``stats['consistency']``); a mismatch raises
+    ``RuntimeError``.
+
+    Illegal parameters raise ``ValueError``/``TypeError``. This function is
+    purely additive and never affects :func:`convert_for_hardware`.
+    """
+    for name, value in (("quantize", quantize), ("dither", dither), ("tile", tile)):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be bool, got {type(value).__name__}")
+    if isinstance(tile_size, bool) or not isinstance(tile_size, int):
+        raise TypeError("tile_size must be an int")
+    if tile_size < 1:
+        raise ValueError("tile_size must be >= 1")
+    if fill is not None and (
+        not isinstance(fill, (tuple, list))
+        or len(fill) != 3
+        or not all(isinstance(c, int) and not isinstance(c, bool) for c in fill)
+        or any(c < 0 or c > 255 for c in fill)
+    ):
+        raise ValueError("fill must be None or a 3-tuple of ints in [0, 255]")
+
+    arr = _as_rgb_array(image)
+    if fill is not None:
+        fill = (int(fill[0]), int(fill[1]), int(fill[2]))
+
+    result = _reduce_banding_once(
+        arr, bool(quantize), bool(dither), bool(tile), tile_size, fill
+    )
+    repeat = _reduce_banding_once(
+        arr, bool(quantize), bool(dither), bool(tile), tile_size, fill
+    )
+    consistent = (
+        np.array_equal(result.image, repeat.image)
+        and np.array_equal(result.tiles, repeat.tiles)
+        and np.array_equal(result.palette4, repeat.palette4)
+        and result.stats == repeat.stats
+    )
+    result.stats["consistency"] = {
+        "two_runs_byte_identical": bool(consistent),
+        "digest_run_1": result.stats["output_digest"],
+        "digest_run_2": repeat.stats["output_digest"],
+    }
+    if not consistent:
+        raise RuntimeError("reduce_banding was not deterministic across two runs")
+    return result
