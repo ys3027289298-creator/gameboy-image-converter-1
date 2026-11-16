@@ -1880,3 +1880,230 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Sprite atlas packing
+# ---------------------------------------------------------------------------
+#
+# Packs several source images into a single atlas image. Every placement is
+# snapped to an ``align`` x ``align`` grid (8x8 by default, matching the GB
+# tile grid): each sprite occupies ceil(w/align) x ceil(h/align) cells, so
+# sprites never share a tile. Two layouts are supported -- "rows" (shelf
+# packing) and "maxrects" (maximal-rectangles, best short-side fit). The
+# recorded offsets/sizes are enough to reconstruct each source image from the
+# atlas pixel-for-pixel (see ``extract_from_atlas``).
+
+
+class AtlasPackError(ValueError):
+    """Raised when the sprites cannot fit the requested atlas size."""
+
+
+@dataclass(frozen=True)
+class AtlasEntry:
+    """Where one source image landed in the atlas (pixels)."""
+
+    name: str
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass
+class Atlas:
+    """A packed atlas: the composited image plus per-sprite placements."""
+
+    image: Image.Image
+    entries: tuple  # tuple[AtlasEntry, ...], same order as the input images
+    method: str
+    align: int
+
+    @property
+    def size(self) -> tuple:
+        """(width, height) of the atlas image in pixels."""
+        return self.image.size
+
+    def utilization(self) -> float:
+        """Fraction of atlas pixels covered by sprite pixels (0..1)."""
+        aw, ah = self.image.size
+        if aw == 0 or ah == 0:
+            return 0.0
+        used = sum(e.width * e.height for e in self.entries)
+        return used / float(aw * ah)
+
+    def extract(self, name: str) -> Image.Image:
+        """Crop one sprite back out of the atlas by its recorded entry."""
+        for e in self.entries:
+            if e.name == name:
+                return extract_from_atlas(self.image, e)
+        raise KeyError(name)
+
+
+def extract_from_atlas(atlas_image: Image.Image, entry: AtlasEntry) -> Image.Image:
+    """Rebuild one source image from the atlas using its recorded offset/size."""
+    return atlas_image.crop((entry.x, entry.y, entry.x + entry.width, entry.y + entry.height))
+
+
+def _cells(n: int, align: int) -> int:
+    """Round ``n`` up to a multiple of ``align``."""
+    return -(-n // align) * align
+
+
+def _pack_rows(rects, width, height):
+    """Shelf packing: sorted tallest-first, filled left-to-right in rows.
+
+    ``rects`` is a list of (cw, ch) cell-aligned sizes; returns a list of
+    (x, y) placements in the same order, or None if they do not fit.
+    """
+    order = sorted(range(len(rects)), key=lambda i: (-rects[i][1], -rects[i][0], i))
+    placements = [None] * len(rects)
+    x = y = row_h = 0
+    for i in order:
+        cw, ch = rects[i]
+        if cw > width:
+            return None
+        if x + cw > width:
+            x = 0
+            y += row_h
+            row_h = 0
+        if y + ch > height:
+            return None
+        placements[i] = (x, y)
+        x += cw
+        row_h = max(row_h, ch)
+    return placements
+
+
+def _split_free_rect(free, placed):
+    """Split a free rect around a placed rect; yields up to 4 leftovers."""
+    fx, fy, fw, fh = free
+    px, py, pw, ph = placed
+    if px >= fx + fw or px + pw <= fx or py >= fy + fh or py + ph <= fy:
+        yield free  # no overlap
+        return
+    if px > fx:
+        yield (fx, fy, px - fx, fh)
+    if px + pw < fx + fw:
+        yield (px + pw, fy, fx + fw - (px + pw), fh)
+    if py > fy:
+        yield (fx, fy, fw, py - fy)
+    if py + ph < fy + fh:
+        yield (fx, py + ph, fw, fy + fh - (py + ph))
+
+
+def _pack_maxrects(rects, width, height):
+    """Maximal-rectangles packing with best short-side-fit selection.
+
+    Same contract as ``_pack_rows``. All sizes/coordinates stay multiples of
+    the alignment because the canvas and every rect are cell-aligned.
+    """
+    order = sorted(range(len(rects)), key=lambda i: (-rects[i][1], -rects[i][0], i))
+    placements = [None] * len(rects)
+    free = [(0, 0, width, height)]
+    for i in order:
+        cw, ch = rects[i]
+        best = None  # (short_side, area_fit, y, x, free_index)
+        for fi, (fx, fy, fw, fh) in enumerate(free):
+            if cw <= fw and ch <= fh:
+                short = min(fw - cw, fh - ch)
+                score = (short, fw * fh - cw * ch, fy, fx, fi)
+                if best is None or score < best:
+                    best = score
+        if best is None:
+            return None
+        _, _, _, _, fi = best
+        fx, fy, _, _ = free[fi]
+        placed = (fx, fy, cw, ch)
+        new_free = []
+        for f in free:
+            new_free.extend(_split_free_rect(f, placed))
+        # Prune rects fully contained in another (keeps the list canonical).
+        pruned = []
+        for a in new_free:
+            ax, ay, aw, ah = a
+            contained = False
+            for b in new_free:
+                if b is a:
+                    continue
+                bx, by, bw, bh = b
+                if ax >= bx and ay >= by and ax + aw <= bx + bw and ay + ah <= by + bh:
+                    contained = True
+                    break
+            if not contained:
+                pruned.append(a)
+        free = pruned
+        placements[i] = (fx, fy)
+    return placements
+
+
+_PACKERS = {"rows": _pack_rows, "maxrects": _pack_maxrects}
+
+
+def _place_or_raise(rects, width, height, method):
+    placements = _PACKERS[method](rects, width, height)
+    if placements is None:
+        raise AtlasPackError(
+            f"{len(rects)} sprites do not fit in a {width}x{height} atlas "
+            f"with the {method!r} layout"
+        )
+    return placements
+
+
+def pack_atlas(images, size=None, align=8, method="maxrects", names=None,
+               background=(0, 0, 0, 0)):
+    """Pack ``images`` (PIL Images) into one atlas on an ``align``-pixel grid.
+
+    ``size`` is the fixed atlas ``(width, height)`` in pixels (both must be
+    multiples of ``align``); when None, the smallest atlas that fits is
+    searched by sweeping candidate widths. ``method`` is "rows" or
+    "maxrects". Raises ``AtlasPackError`` when a fixed size cannot hold the
+    sprites. Returns an ``Atlas`` whose entries carry each sprite's offset
+    and size, in input order.
+    """
+    if method not in _PACKERS:
+        raise ValueError(f"unknown packing method {method!r}; expected one of {sorted(_PACKERS)}")
+    if align <= 0:
+        raise ValueError("align must be a positive integer")
+    images = [im.convert("RGBA") for im in images]
+    if not images:
+        raise ValueError("pack_atlas needs at least one image")
+    if names is None:
+        names = [f"sprite_{i}" for i in range(len(images))]
+    if len(names) != len(images):
+        raise ValueError("names must match images in length")
+
+    rects = [(_cells(im.width, align), _cells(im.height, align)) for im in images]
+
+    if size is not None:
+        width, height = size
+        if width % align or height % align:
+            raise ValueError(f"atlas size {size} must be a multiple of align={align}")
+        placements = _place_or_raise(rects, width, height, method)
+    else:
+        # Auto-size: sweep candidate widths from the widest sprite up to the
+        # total laid out in one row; keep the packing with the smallest area
+        # (ties: narrower atlas). Height is unbounded during the sweep and
+        # trimmed to what the layout actually used.
+        total_w = sum(cw for cw, _ in rects)
+        total_h = sum(ch for _, ch in rects)
+        min_w = max(cw for cw, _ in rects)
+        best = None  # (area, width, height, placements)
+        for width in range(min_w, total_w + align, align):
+            placements = _PACKERS[method](rects, width, total_h)
+            if placements is None:
+                continue
+            used_h = max(y + rects[i][1] for i, (x, y) in enumerate(placements))
+            score = (width * used_h, width)
+            if best is None or score < best[:2]:
+                best = (score[0], score[1], used_h, placements)
+        if best is None:  # unreachable: width == total_w always fits one row
+            raise AtlasPackError("sprites do not fit in any auto-sized atlas")
+        _, width, height, placements = best
+
+    atlas_img = Image.new("RGBA", (width, height), background)
+    entries = []
+    for im, name, (x, y) in zip(images, names, placements):
+        atlas_img.paste(im, (x, y))
+        entries.append(AtlasEntry(name=name, x=x, y=y, width=im.width, height=im.height))
+    return Atlas(image=atlas_img, entries=tuple(entries), method=method, align=align)
