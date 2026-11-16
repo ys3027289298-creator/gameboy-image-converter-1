@@ -8,6 +8,7 @@ breakdown these functions implement.
 """
 
 import heapq
+import struct
 import threading
 from dataclasses import dataclass, replace
 
@@ -1880,3 +1881,377 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Animation frame-difference (delta-block) encoding
+# ---------------------------------------------------------------------------
+#
+# Most pixels do not move between animation frames. A sequence is encoded as a
+# full baseline frame (frame 0) plus, for every later frame, only the block
+# indices whose content differs from the *previous reconstructed* frame and
+# the new block contents. Playback chains reconstruction on the running frame,
+# so no full frame after the first is ever stored.
+#
+# Two knobs, both constructor/function parameters (never globals):
+#   * ``block_size`` -- square block edge in pixels; frame dimensions must be
+#     exact multiples of it.
+#   * ``change_threshold`` -- a block is recorded only when more than this
+#     many of its pixels differ from the previous frame (a pixel differs if
+#     any of its channels does). 0 (default) is lossless: any differing pixel
+#     records the block and reconstruction is pixel-exact. Larger values trade
+#     fidelity for size, leaving below-threshold blocks at their previous
+#     content.
+#
+# The serialization format (``serialize_frame_diff``) is plain ``struct``
+# packing of the same arrays -- stdlib only, no new dependency -- and is what
+# the volume numbers measure; ``frame_diff_full_size`` is the equivalent
+# per-frame full-storage byte count for the apples-to-apples comparison.
+
+# Wire format markers for serialize_frame_diff / deserialize_frame_diff.
+FRAME_DIFF_MAGIC = b"GBFD"
+FRAME_DIFF_VERSION = 1
+
+# Fixed header layout: magic(4) version(B) flags(B) frames(I) height(I)
+# width(I) channels(I) block_size(I) change_threshold(I).
+_FRAME_DIFF_HEADER = struct.Struct("!4sBBIIIIII")
+# Per frame: n_changed(I), then n_changed * block_index(I); pixel payloads
+# follow as raw bytes (their length is fixed by the frame/block dimensions).
+_FRAME_DIFF_INDEX = struct.Struct("!I")
+
+
+class MissingBaselineError(KeyError):
+    """Raised when a frame-diff stream is decoded without its baseline frame.
+
+    Subclasses ``KeyError`` because the baseline is the missing key every
+    later frame's chain reconstruction depends on; without it none of the
+    delta blocks can be placed.
+    """
+
+
+@dataclass
+class FrameDiff:
+    """One encoded frame: changed block indices (row-major) and their contents.
+
+    ``changed`` are block-grid indices in strictly ascending order; ``blocks``
+    is the matching ``(n, block_size, block_size, channels)`` uint8 content.
+    An empty pair means the frame is identical to its predecessor.
+    """
+
+    changed: np.ndarray   # (k,) int32 row-major block indices, ascending
+    blocks: np.ndarray    # (k, bs, bs, c) uint8 replacement block contents
+
+
+@dataclass
+class FrameDiffSequence:
+    """A whole animation encoded relative to one baseline frame.
+
+    ``baseline`` is the full frame 0 (``None`` models a stream whose baseline
+    was lost/corrupted in transit); ``deltas[i]`` describes frame i+1 against
+    reconstructed frame i. ``width``/``height`` are cached so a baseline-less
+    sequence still knows its geometry.
+    """
+
+    baseline: np.ndarray | None            # (h, w, c) uint8, or None if lost
+    deltas: list                           # list[FrameDiff], len == n_frames - 1
+    block_size: int
+    change_threshold: int
+    width: int
+    height: int
+
+
+def _validate_rgb_frame(frame: np.ndarray, where: str) -> np.ndarray:
+    arr = np.asarray(frame, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"{where} must be an (h, w, 3) uint8 array, got shape {arr.shape}")
+    return arr
+
+
+def _block_grid(frame_shape: tuple, block_size: int, where: str) -> tuple:
+    if not isinstance(block_size, (int, np.integer)) or int(block_size) < 1:
+        raise ValueError(f"{where}: block_size must be a positive integer, got {block_size!r}")
+    block_size = int(block_size)
+    h, w = frame_shape[:2]
+    if h % block_size or w % block_size:
+        raise ValueError(
+            f"{where}: frame dimensions {h}x{w} must be multiples of block_size {block_size}"
+        )
+    return h // block_size, w // block_size
+
+
+def _frame_blocks(frame: np.ndarray, block_size: int, gh: int, gw: int) -> np.ndarray:
+    """Reshape (h, w, c) pixels into (gh*gw, bs, bs, c) row-major blocks."""
+    c = frame.shape[2]
+    blocks = frame.reshape(gh, block_size, gw, block_size, c)
+    return blocks.transpose(0, 2, 1, 3, 4).reshape(gh * gw, block_size, block_size, c)
+
+
+def encode_frame_diff(
+    frames: list, *, block_size: int = 8, change_threshold: int = 0
+) -> FrameDiffSequence:
+    """Encode an animation with frame 0 as baseline and per-frame block deltas.
+
+    ``frames`` is a list of equally-shaped ``(h, w, 3)`` uint8 arrays. Frame 0
+    is stored in full; each later frame is compared against the previous
+    *reconstructed* frame (so chains stay consistent) and only blocks with more
+    than ``change_threshold`` differing pixels are recorded. With threshold 0
+    the encoding is lossless -- ``decode_frame_diff`` reproduces every input
+    frame pixel-exactly.
+    """
+    if not isinstance(frames, (list, tuple)) or len(frames) < 1:
+        raise ValueError("frames must be a non-empty list of (h, w, 3) uint8 arrays")
+    baseline = _validate_rgb_frame(frames[0], "frames[0]")
+    h, w, c = baseline.shape
+    gh, gw = _block_grid(baseline.shape, block_size, "encode_frame_diff")
+    if not isinstance(change_threshold, (int, np.integer)) or int(change_threshold) < 0:
+        raise ValueError(
+            f"change_threshold must be a non-negative integer, got {change_threshold!r}"
+        )
+    change_threshold = int(change_threshold)
+    max_diffs = block_size * block_size
+    if change_threshold >= max_diffs:
+        raise ValueError(
+            f"change_threshold {change_threshold} must be smaller than the "
+            f"{max_diffs} pixels in a {block_size}x{block_size} block"
+        )
+
+    deltas: list = []
+    prev = baseline
+    for fi, frame in enumerate(frames[1:], start=1):
+        cur = _validate_rgb_frame(frame, f"frames[{fi}]")
+        if cur.shape != baseline.shape:
+            raise ValueError(
+                f"frames[{fi}] shape {cur.shape} != frames[0] shape {baseline.shape}"
+            )
+        prev_blocks = _frame_blocks(prev, block_size, gh, gw)
+        cur_blocks = _frame_blocks(cur, block_size, gh, gw)
+        # Per-block count of pixels (any channel) that differ from the previous
+        # frame; change_threshold is therefore a count of pixels, not channels.
+        diff_pixels = np.any(prev_blocks != cur_blocks, axis=-1)
+        diff_counts = np.count_nonzero(diff_pixels, axis=(1, 2))
+        changed = np.flatnonzero(diff_counts > change_threshold).astype(np.int32)
+        deltas.append(FrameDiff(changed=changed, blocks=cur_blocks[changed].copy()))
+        # Reconstruct what the decoder will hold after this frame: recorded
+        # blocks take the new content, everything else stays as it was.
+        recon_blocks = prev_blocks.copy()
+        recon_blocks[changed] = cur_blocks[changed]
+        prev = recon_blocks.reshape(gh, gw, block_size, block_size, c).transpose(
+            0, 2, 1, 3, 4
+        ).reshape(h, w, c)
+
+    return FrameDiffSequence(
+        baseline=baseline.copy(),
+        deltas=deltas,
+        block_size=block_size,
+        change_threshold=change_threshold,
+        width=w,
+        height=h,
+    )
+
+
+def decode_frame_diff(seq: FrameDiffSequence) -> list:
+    """Reconstruct every frame from a :class:`FrameDiffSequence`.
+
+    Chains on the running frame: baseline first, then each delta replaces its
+    listed blocks in place. Raises :class:`MissingBaselineError` when
+    ``seq.baseline is None`` -- the deltas alone cannot rebuild any frame.
+    """
+    if seq.baseline is None:
+        raise MissingBaselineError(
+            "frame-diff sequence has no baseline frame; delta blocks cannot be "
+            "reconstructed without frame 0"
+        )
+    baseline = _validate_rgb_frame(seq.baseline, "baseline")
+    h, w, c = baseline.shape
+    if (h, w) != (seq.height, seq.width):
+        raise ValueError(
+            f"baseline shape {h}x{w} does not match sequence geometry "
+            f"{seq.height}x{seq.width}"
+        )
+    gh, gw = _block_grid(baseline.shape, seq.block_size, "decode_frame_diff")
+    total_blocks = gh * gw
+
+    frames = [baseline.copy()]
+    running = baseline.copy()
+    for fi, delta in enumerate(seq.deltas, start=1):
+        changed = np.asarray(delta.changed, dtype=np.int32).reshape(-1)
+        blocks = np.asarray(delta.blocks, dtype=np.uint8)
+        if changed.shape[0] != blocks.shape[0]:
+            raise ValueError(f"delta {fi}: {changed.shape[0]} indices but {blocks.shape[0]} blocks")
+        if np.any(changed < 0) or np.any(changed >= total_blocks):
+            raise ValueError(f"delta {fi}: block index outside the {gh}x{gw} grid")
+        if blocks.size and blocks.shape[1:] != (seq.block_size, seq.block_size, c):
+            raise ValueError(
+                f"delta {fi}: block content shape {blocks.shape[1:]} != "
+                f"({seq.block_size}, {seq.block_size}, {c})"
+            )
+        if changed.size and np.any(np.diff(changed) <= 0):
+            raise ValueError(f"delta {fi}: changed block indices must be strictly ascending")
+        running_blocks = _frame_blocks(running, seq.block_size, gh, gw)
+        running_blocks[changed] = blocks
+        running = running_blocks.reshape(gh, gw, seq.block_size, seq.block_size, c).transpose(
+            0, 2, 1, 3, 4
+        ).reshape(h, w, c)
+        frames.append(running.copy())
+    return frames
+
+
+def frame_diff_full_size(seq: FrameDiffSequence) -> int:
+    """Bytes needed to store every frame fully (raw pixel payload, no codec).
+
+    The reference number the delta encoding is compared against:
+    ``n_frames * height * width * channels`` uint8 bytes.
+    """
+    n_frames = len(seq.deltas) + 1
+    channels = 3 if seq.baseline is None else int(seq.baseline.shape[2])
+    return n_frames * seq.height * seq.width * channels
+
+
+def frame_diff_payload_size(seq: FrameDiffSequence) -> int:
+    """Raw pixel payload bytes of the delta encoding (baseline + delta blocks).
+
+    Counts only image bytes, exactly as ``frame_diff_full_size`` does, so the
+    two numbers are directly comparable without header/index bookkeeping.
+    """
+    channels = 3 if seq.baseline is None else int(seq.baseline.shape[2])
+    block_pixels = seq.block_size * seq.block_size * channels
+    changed_blocks = sum(int(np.asarray(d.changed).shape[0]) for d in seq.deltas)
+    baseline_bytes = 0 if seq.baseline is None else seq.height * seq.width * channels
+    return baseline_bytes + changed_blocks * block_pixels
+
+
+def frame_diff_changed_blocks(seq: FrameDiffSequence) -> list:
+    """Number of recorded blocks per delta frame (length ``n_frames - 1``)."""
+    return [int(np.asarray(d.changed).shape[0]) for d in seq.deltas]
+
+
+def frame_diff_pixel_mismatch(frames_a: list, frames_b: list) -> list:
+    """Per-frame count of differing pixels between two reconstructed sequences.
+
+    A pixel counts once if any of its channels differs. Used to demonstrate
+    reconstruction fidelity (0 for threshold-0 lossless encodings) and to
+    quantify the loss a non-zero threshold introduces.
+    """
+    if len(frames_a) != len(frames_b):
+        raise ValueError(
+            f"frame counts differ: {len(frames_a)} vs {len(frames_b)}"
+        )
+    out = []
+    for i, (a, b) in enumerate(zip(frames_a, frames_b)):
+        aa, bb = np.asarray(a), np.asarray(b)
+        if aa.shape != bb.shape:
+            raise ValueError(f"frame {i} shapes differ: {aa.shape} vs {bb.shape}")
+        out.append(int(np.count_nonzero(np.any(aa != bb, axis=-1))))
+    return out
+
+
+def serialize_frame_diff(seq: FrameDiffSequence) -> bytes:
+    """Pack a :class:`FrameDiffSequence` into self-describing bytes (stdlib only).
+
+    Layout: fixed header (magic/version/flags/frame count/geometry/settings),
+    then per frame a uint32 changed-block count, that many uint32 row-major
+    block indices, and the raw replacement-block pixels. The baseline frame is
+    written as frame 0's full pixel payload; flag bit 0 marks its presence so a
+    baseline-less stream round-trips and lets ``deserialize_frame_diff`` raise
+    :class:`MissingBaselineError` instead of silently producing garbage.
+    """
+    if seq.baseline is None:
+        flags, channels = 0, 3
+    else:
+        baseline = _validate_rgb_frame(seq.baseline, "baseline")
+        flags, channels = 1, int(baseline.shape[2])
+        if (baseline.shape[0], baseline.shape[1]) != (seq.height, seq.width):
+            raise ValueError("baseline dimensions do not match sequence width/height")
+    gh, gw = _block_grid(
+        (seq.height, seq.width, channels), seq.block_size, "serialize_frame_diff"
+    )
+    n_frames = len(seq.deltas) + 1
+    out = bytearray()
+    out += _FRAME_DIFF_HEADER.pack(
+        FRAME_DIFF_MAGIC,
+        FRAME_DIFF_VERSION,
+        flags,
+        n_frames,
+        seq.height,
+        seq.width,
+        channels,
+        seq.block_size,
+        seq.change_threshold,
+    )
+    if flags:
+        out += baseline.tobytes()
+    for fi, delta in enumerate(seq.deltas, start=1):
+        changed = np.asarray(delta.changed, dtype=np.int32).reshape(-1)
+        blocks = np.asarray(delta.blocks, dtype=np.uint8)
+        if changed.shape[0] != blocks.shape[0]:
+            raise ValueError(f"delta {fi}: index/block count mismatch")
+        if np.any(changed < 0) or np.any(changed >= gh * gw):
+            raise ValueError(f"delta {fi}: block index outside the {gh}x{gw} grid")
+        if blocks.size and blocks.shape[1:] != (seq.block_size, seq.block_size, channels):
+            raise ValueError(f"delta {fi}: unexpected block content shape {blocks.shape[1:]}")
+        out += _FRAME_DIFF_INDEX.pack(int(changed.shape[0]))
+        out += changed.astype(">i4", copy=False).tobytes()
+        out += blocks.tobytes()
+    return bytes(out)
+
+
+def deserialize_frame_diff(data: bytes) -> FrameDiffSequence:
+    """Inverse of :func:`serialize_frame_diff`.
+
+    Validates the magic/version header and reconstructs every delta. A stream
+    whose baseline flag is clear raises :class:`MissingBaselineError` -- the
+    deltas are parsed and returned on the exception's ``sequence`` attribute
+    so callers can still inspect what survived, but no frame can be rebuilt.
+    """
+    if len(data) < _FRAME_DIFF_HEADER.size:
+        raise ValueError("frame-diff blob is shorter than its header")
+    magic, version, flags, n_frames, height, width, channels, block_size, threshold = (
+        _FRAME_DIFF_HEADER.unpack_from(data, 0)
+    )
+    if magic != FRAME_DIFF_MAGIC:
+        raise ValueError(f"bad frame-diff magic {magic!r}; expected {FRAME_DIFF_MAGIC!r}")
+    if version != FRAME_DIFF_VERSION:
+        raise ValueError(f"unsupported frame-diff version {version}; expected {FRAME_DIFF_VERSION}")
+    if n_frames < 1:
+        raise ValueError("frame-diff stream declares no frames")
+    _block_grid((height, width, channels), block_size, "deserialize_frame_diff")
+    offset = _FRAME_DIFF_HEADER.size
+    baseline = None
+    if flags & 1:
+        end = offset + height * width * channels
+        baseline = np.frombuffer(data, dtype=np.uint8, count=height * width * channels,
+                                 offset=offset).reshape(height, width, channels).copy()
+        offset = end
+    deltas = []
+    block_pixels = block_size * block_size * channels
+    for fi in range(1, n_frames):
+        (k,) = _FRAME_DIFF_INDEX.unpack_from(data, offset)
+        offset += _FRAME_DIFF_INDEX.size
+        end = offset + k * 4
+        changed = np.frombuffer(data, dtype=">i4", count=k, offset=offset).astype(np.int32)
+        offset = end
+        end = offset + k * block_pixels
+        blocks = np.frombuffer(
+            data, dtype=np.uint8, count=k * block_pixels, offset=offset
+        ).reshape(k, block_size, block_size, channels).copy()
+        offset = end
+        deltas.append(FrameDiff(changed=changed, blocks=blocks))
+    if offset != len(data):
+        raise ValueError(f"{len(data) - offset} trailing bytes in frame-diff blob")
+
+    seq = FrameDiffSequence(
+        baseline=baseline,
+        deltas=deltas,
+        block_size=block_size,
+        change_threshold=threshold,
+        width=width,
+        height=height,
+    )
+    if baseline is None:
+        err = MissingBaselineError(
+            "frame-diff stream has no baseline frame (flag bit clear); delta "
+            "blocks cannot be reconstructed without frame 0"
+        )
+        err.sequence = seq  # type: ignore[attr-defined]
+        raise err
+    return seq
