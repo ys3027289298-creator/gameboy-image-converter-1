@@ -8,6 +8,7 @@ breakdown these functions implement.
 """
 
 import heapq
+import io
 import threading
 from dataclasses import dataclass, replace
 
@@ -1880,3 +1881,303 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Animation -- frame compositing and palette-consistent GIF export
+# ---------------------------------------------------------------------------
+#
+# `compose_animation` folds a sequence of (possibly transparent) frames into
+# full-canvas composited frames according to each frame's dispose mode;
+# `shared_palette_frames` maps the composited frames onto ONE shared palette
+# (losslessly whenever the frames' colors fit); `export_animation` runs both
+# and encodes an animated GIF with configurable loop count. Pure functions
+# over PIL images / numpy arrays, like the rest of this module.
+
+# Dispose modes (applied AFTER a frame has been composited and emitted):
+#   keep       -- leave the canvas as-is; the next frame draws on top.
+#   background -- clear the pixels this frame drew (alpha > 0) back to the
+#                 background, so the next frame starts from the pre-frame
+#                 backdrop wherever this frame painted.
+#   previous   -- restore the canvas to its exact state before this frame
+#                 was composited.
+DISPOSE_KEEP = "keep"
+DISPOSE_BACKGROUND = "background"
+DISPOSE_PREVIOUS = "previous"
+DISPOSE_MODES = (DISPOSE_KEEP, DISPOSE_BACKGROUND, DISPOSE_PREVIOUS)
+
+DEFAULT_FRAME_DELAY_MS = 100
+
+
+def _normalize_background(background) -> tuple:
+    """Background as an (R, G, B, A) tuple. None -> fully transparent."""
+    if background is None:
+        return (0, 0, 0, 0)
+    bg = tuple(int(c) for c in background)
+    if len(bg) == 3:
+        return bg + (255,)
+    if len(bg) == 4:
+        return bg
+    raise ValueError(f"background must be an RGB or RGBA tuple, got {background!r}")
+
+
+def _normalize_delays(delays, n: int) -> list:
+    """Per-frame delays as a list of n non-negative int milliseconds."""
+    if delays is None:
+        return [DEFAULT_FRAME_DELAY_MS] * n
+    if isinstance(delays, (int, np.integer)):
+        delays = [int(delays)] * n
+    delays = [int(d) for d in delays]
+    if len(delays) != n:
+        raise ValueError(f"delays: expected {n} entries, got {len(delays)}")
+    for d in delays:
+        if d < 0:
+            raise ValueError(f"delays must be non-negative, got {d}")
+    return delays
+
+
+def _normalize_disposes(disposes, n: int) -> list:
+    """Per-frame dispose modes as a list of n entries of DISPOSE_MODES."""
+    if disposes is None:
+        return [DISPOSE_KEEP] * n
+    if isinstance(disposes, str):
+        disposes = [disposes] * n
+    disposes = list(disposes)
+    if len(disposes) != n:
+        raise ValueError(f"disposes: expected {n} entries, got {len(disposes)}")
+    for d in disposes:
+        if d not in DISPOSE_MODES:
+            raise ValueError(
+                f"unknown dispose mode {d!r} (expected one of {DISPOSE_MODES!r})"
+            )
+    return disposes
+
+
+def compose_animation(
+    frames,
+    delays=None,
+    disposes=None,
+    background=None,
+    first_frame_base: bool = True,
+) -> tuple:
+    """Composite frames into a full-canvas sequence per their dispose modes.
+
+    ``frames`` is a non-empty list of same-sized PIL images (any mode; they
+    are converted to RGBA, so transparent regions let earlier frames show
+    through). ``delays`` is None (100 ms each), a scalar, or a per-frame list
+    of non-negative millisecond ints. ``disposes`` is None (all "keep"), a
+    single mode, or a per-frame list drawn from ``DISPOSE_MODES``.
+    ``background`` is the canvas backdrop (None -> transparent).
+
+    When ``first_frame_base`` is True (default), frame 0 IS the baseline: it
+    is composited onto the background and its own dispose mode is not applied
+    (there is no earlier state to restore or clear to). When False, frame 0
+    is an ordinary frame over the plain background, so its dispose mode IS
+    applied before frame 1 is drawn.
+
+    Returns ``(composited, delays_ms)``: one full-canvas RGBA image per input
+    frame (the pixels a viewer would display while that frame is up) and the
+    normalized per-frame delay list. Raises ValueError on an empty sequence,
+    mismatched frame sizes, or invalid delays/dispose modes.
+    """
+    if not frames:
+        raise ValueError("compose_animation needs at least one frame")
+    frames = [f.convert("RGBA") for f in frames]
+    size = frames[0].size
+    for i, f in enumerate(frames):
+        if f.size != size:
+            raise ValueError(
+                f"frame sizes differ: frame 0 is {size[0]}x{size[1]} but "
+                f"frame {i} is {f.size[0]}x{f.size[1]} -- all frames of an "
+                "animation must share one canvas size"
+            )
+    n = len(frames)
+    delays = _normalize_delays(delays, n)
+    disposes = _normalize_disposes(disposes, n)
+    bg = _normalize_background(background)
+
+    canvas = Image.new("RGBA", size, bg)
+    bg_px = np.array(bg, dtype=np.uint8)
+    composited = []
+    for i, frame in enumerate(frames):
+        if i == 0 and first_frame_base:
+            # Frame 0 is the baseline: composite it and skip its dispose --
+            # there is no earlier state to restore or clear to.
+            canvas = Image.alpha_composite(canvas, frame)
+            composited.append(canvas.copy())
+            continue
+        prev = canvas.copy() if disposes[i] == DISPOSE_PREVIOUS else None
+        canvas = Image.alpha_composite(canvas, frame)
+        composited.append(canvas.copy())
+        if disposes[i] == DISPOSE_BACKGROUND:
+            # Clear the pixels this frame actually drew back to background.
+            mask = np.asarray(frame.getchannel("A")) > 0
+            arr = np.asarray(canvas).copy()
+            arr[mask] = bg_px
+            canvas = Image.fromarray(arr, "RGBA")
+        elif disposes[i] == DISPOSE_PREVIOUS:
+            canvas = prev
+    return composited, delays
+
+
+def _flatten_rgba(frame: Image.Image, background) -> Image.Image:
+    """Flatten an RGBA frame over an RGB background color -> RGB image."""
+    frame = frame.convert("RGBA")
+    bg = Image.new("RGBA", frame.size, tuple(background) + (255,))
+    return Image.alpha_composite(bg, frame).convert("RGB")
+
+
+def _p_image_from_indices(idx: np.ndarray, palette: np.ndarray) -> Image.Image:
+    """Build a P-mode image from a 2-D index array and an (N, 3) palette."""
+    img = Image.fromarray(idx.astype(np.uint8), "P")
+    flat = [int(c) for color in palette for c in color]
+    flat.extend([0] * (768 - len(flat)))
+    img.putpalette(flat)
+    return img
+
+
+def shared_palette_frames(
+    frames,
+    palette=None,
+    max_colors: int = 256,
+    background=(0, 0, 0),
+) -> tuple:
+    """Map frames onto ONE shared palette -> (P-mode frames, palette array).
+
+    Every returned frame is P-mode with byte-identical palette tables, so the
+    set is palette-consistent by construction. ``background`` is the RGB color
+    transparent regions are flattened onto first.
+
+    Palette resolution:
+
+    * ``palette`` given (an (N, 3) array-like, e.g. the DMG ramp or a stack of
+      GBC palettes): every pixel is mapped to its nearest palette color in
+      CIELAB. Colors already in the palette map to themselves exactly, so
+      pipeline output (which only contains palette colors) round-trips
+      pixel-identically.
+    * Otherwise, when the frames together use <= ``max_colors`` distinct
+      colors, the palette IS those colors (sorted) and the mapping is exact --
+      this is what keeps single-frame export pixel-identical to the source.
+    * Otherwise the stacked frames are median-cut quantized to ``max_colors``
+      once (no dithering) and every frame is mapped to that shared palette.
+    """
+    if not frames:
+        raise ValueError("shared_palette_frames needs at least one frame")
+    max_colors = int(max_colors)
+    if not 1 <= max_colors <= 256:
+        raise ValueError(f"max_colors must be in [1, 256], got {max_colors}")
+    bg = tuple(int(c) for c in background)
+    if len(bg) != 3:
+        raise ValueError(f"background must be an RGB tuple, got {background!r}")
+
+    rgb = [
+        f.convert("RGB") if f.mode != "RGBA" else _flatten_rgba(f, bg)
+        for f in frames
+    ]
+    arrs = [np.asarray(im, dtype=np.uint8) for im in rgb]
+    size = rgb[0].size
+    for im in rgb:
+        if im.size != size:
+            raise ValueError("all frames must share one canvas size")
+
+    if palette is not None:
+        pal = np.asarray(palette, dtype=np.uint8).reshape(-1, 3)
+        if len(pal) > 256:
+            raise ValueError(f"palette has {len(pal)} colors; 256 max")
+        pal_lab = _rgb_to_lab(pal)
+        out = []
+        for arr in arrs:
+            h, w = arr.shape[:2]
+            uq, inv = np.unique(arr.reshape(-1, 3), axis=0, return_inverse=True)
+            nearest = _nearest_indices(_rgb_to_lab(uq), pal_lab)
+            idx = nearest[inv].reshape(h, w)
+            out.append(_p_image_from_indices(idx, pal))
+        return out, pal
+
+    stacked = np.concatenate([a.reshape(-1, 3) for a in arrs], axis=0)
+    uq, inv = np.unique(stacked, axis=0, return_inverse=True)
+    if len(uq) <= max_colors:
+        # Lossless path: the palette is exactly the frames' own colors.
+        h, w = arrs[0].shape[:2]
+        per_frame = np.split(inv, np.cumsum([a.size // 3 for a in arrs])[:-1])
+        out = [
+            _p_image_from_indices(idx.reshape(h, w), uq) for idx in per_frame
+        ]
+        return out, uq
+
+    # Too many colors: one median-cut fit over the stacked frames, then map
+    # every frame to that shared palette (no dithering -- position-stable).
+    tall = Image.fromarray(
+        stacked.reshape(-1, size[0], 3).astype(np.uint8), "RGB"
+    )
+    quant = tall.quantize(
+        colors=max_colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+    )
+    out = [
+        im.quantize(palette=quant, dither=Image.Dither.NONE) for im in rgb
+    ]
+    pal_arr = np.asarray(quant.getpalette(), dtype=np.uint8).reshape(-1, 3)[:max_colors]
+    return out, pal_arr
+
+
+def export_animation(
+    frames,
+    delays=None,
+    disposes=None,
+    *,
+    loop: int = 0,
+    background=None,
+    first_frame_base: bool = True,
+    palette=None,
+    max_colors: int = 256,
+) -> tuple:
+    """Compose frames and encode them as one palette-consistent animated GIF.
+
+    Runs ``compose_animation`` (per-frame delay + dispose handling) then
+    ``shared_palette_frames`` (one shared palette for the whole sequence) and
+    encodes the result as an animated GIF. ``loop`` is the NETSCAPE loop
+    count: 0 (default) loops forever, N plays the animation N times.
+    ``background`` serves both as the compositing backdrop and the color
+    transparent regions are flattened onto (None -> black for the flatten;
+    pass an RGB tuple for anything else).
+
+    Returns ``(gif_bytes, info)`` where info holds ``n_frames``,
+    ``delays_ms``, ``total_duration_ms``, ``loop``, ``size`` (w, h),
+    ``palette_colors`` and ``size_bytes``. A single-frame input yields a
+    still GIF whose pixels are identical to the source frame whenever its
+    colors fit the palette (always the case for GB pipeline output).
+    """
+    loop = int(loop)
+    if loop < 0:
+        raise ValueError(f"loop count must be >= 0 (0 = forever), got {loop}")
+    bg_compose = background
+    bg_flat = (0, 0, 0) if background is None else tuple(background)[:3]
+    composited, delays = compose_animation(
+        frames, delays=delays, disposes=disposes,
+        background=bg_compose, first_frame_base=first_frame_base,
+    )
+    p_frames, pal = shared_palette_frames(
+        composited, palette=palette, max_colors=max_colors, background=bg_flat
+    )
+    buf = io.BytesIO()
+    p_frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=p_frames[1:],
+        duration=delays,
+        loop=loop,
+        disposal=1,  # frames are pre-composited full canvases: no disposal
+        optimize=False,
+    )
+    data = buf.getvalue()
+    info = {
+        "n_frames": len(p_frames),
+        "delays_ms": list(delays),
+        "total_duration_ms": int(sum(delays)),
+        "loop": loop,
+        "size": p_frames[0].size,
+        "palette_colors": int(len(pal)),
+        "size_bytes": len(data),
+    }
+    return data, info
