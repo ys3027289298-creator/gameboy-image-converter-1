@@ -1301,6 +1301,359 @@ def merge_to_budget(gb: GBImage, budget: int, allow_flips: bool) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Input validation -- dimension / channel / bit-depth / palette checks
+# ---------------------------------------------------------------------------
+#
+# User-supplied assets arrive in all sorts of shapes and modes. The converter
+# itself silently tolerates most of them (``convert_for_hardware`` RGB-converts
+# any mode and center-crops to a multiple of 8), but a batch uploader wants the
+# checks reported up front with actionable fix advice, and a strict pipeline
+# wants non-conforming inputs rejected before any conversion work runs. The
+# functions below are a pure read-only layer over PIL images: validation never
+# mutates the input and never depends on a preset, so the conversion path is
+# untouched pixel-for-pixel (verified against ``convert_for_hardware`` output).
+
+# Tile geometry: every GB image is a grid of 8x8 tiles.
+TILE_SIZE = 8
+# GBC hardware ceiling: 8 palettes x 4 colors (the palette-count check applies
+# only to palette-indexed "P" images; RGB images carry no palette of their own).
+INPUT_PALETTE_COLOR_LIMIT = 32
+# The converter consumes 8 bits per RGB channel; any other storage depth is
+# reported (PIL's convert("RGB") promotes it losslessly in auto-fix mode).
+EXPECTED_CHANNEL_DEPTH_BITS = 8
+EXPECTED_CHANNEL_COUNT = 3
+
+VALIDATION_STRICT = "strict"
+VALIDATION_AUTOFIX = "autofix"
+_VALIDATION_MODES = (VALIDATION_STRICT, VALIDATION_AUTOFIX)
+
+
+@dataclass
+class ValidationCheck:
+    """One input check and its verdict.
+
+    ``name`` is a stable snake_case id ("dimensions", "channels", "bit_depth",
+    "palette_colors"); ``passed`` is the verdict (an inapplicable check passes
+    vacuously and flags ``applicable=False``); ``detail`` is a human-readable
+    measurement; ``fix`` is the concrete remediation when the check fails (an
+    empty string when nothing is wrong or nothing applies).
+    """
+
+    name: str
+    passed: bool
+    detail: str
+    fix: str
+    applicable: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "passed": self.passed,
+            "detail": self.detail,
+            "fix": self.fix,
+            "applicable": self.applicable,
+        }
+
+
+@dataclass
+class InputValidationReport:
+    """The four per-input checks plus an overall verdict and mode echo."""
+
+    checks: list            # list[ValidationCheck], in check order
+    passed: bool            # True iff every applicable check passed
+    mode: str               # the validation mode that produced this report
+    original_size: tuple    # (width, height) as received
+    original_mode: str      # PIL mode as received
+
+    @property
+    def failures(self) -> list:
+        return [c for c in self.checks if not c.passed]
+
+    def get_check(self, name: str) -> ValidationCheck:
+        for check in self.checks:
+            if check.name == name:
+                return check
+        raise KeyError(name)
+
+    def to_dict(self) -> dict:
+        return {
+            "passed": self.passed,
+            "mode": self.mode,
+            "original_size": self.original_size,
+            "original_mode": self.original_mode,
+            "checks": [c.to_dict() for c in self.checks],
+        }
+
+    def format_text(self) -> str:
+        """Render the report as the line-oriented text shown to end users."""
+        lines = [
+            (
+                f"Input validation ({self.mode}): "
+                f"{'PASS' if self.passed else 'FAIL'} "
+                f"({self.original_size[0]}x{self.original_size[1]}, "
+                f"mode={self.original_mode})"
+            ),
+        ]
+        for check in self.checks:
+            if not check.applicable:
+                verdict = "n/a "
+            elif check.passed:
+                verdict = "ok  "
+            else:
+                verdict = "FAIL"
+            lines.append(f"  [{verdict}] {check.name}: {check.detail}")
+            if check.fix:
+                lines.append(f"         fix: {check.fix}")
+        return "\n".join(lines)
+
+
+class InputValidationError(ValueError):
+    """Raised in strict mode when one or more input checks fail.
+
+    Carries the full ``InputValidationReport`` so callers can render the same
+    per-item details that auto-fix mode returns as data.
+    """
+
+    def __init__(self, report: InputValidationReport):
+        self.report = report
+        failed = ", ".join(c.name for c in report.failures)
+        super().__init__(
+            f"input validation failed in strict mode: {failed} "
+            f"(see report for per-check details and fix suggestions)"
+        )
+
+
+def _mode_channel_count(mode: str) -> int:
+    """Number of bands PIL stores for ``mode`` (alpha counted separately)."""
+    return Image.getmodebands(mode)
+
+
+def _mode_bit_depth(mode: str) -> int:
+    """Bits per channel/sample for a PIL mode (1 for bilevel, 32 for I/F)."""
+    if mode == "1":
+        return 1
+    if mode in ("I", "F"):
+        # 32-bit integer / float pixels rather than 8-bit samples.
+        return 32
+    return 8
+
+
+def _check_dimensions(image: Image.Image) -> ValidationCheck:
+    width, height = image.size
+    w_ok = width % TILE_SIZE == 0
+    h_ok = height % TILE_SIZE == 0
+    if w_ok and h_ok:
+        return ValidationCheck(
+            "dimensions", True,
+            f"{width}x{height}: both dimensions are multiples of {TILE_SIZE}.",
+            "",
+        )
+    new_w = (width // TILE_SIZE) * TILE_SIZE
+    new_h = (height // TILE_SIZE) * TILE_SIZE
+    if new_w < TILE_SIZE or new_h < TILE_SIZE:
+        fix = (
+            f"image must be at least {TILE_SIZE}x{TILE_SIZE} after trimming; "
+            "pad or replace it (it cannot be cropped to a whole tile)."
+        )
+    else:
+        fix = (
+            f"center-crop to {new_w}x{new_h} "
+            f"(remove {width - new_w}px width / {height - new_h}px height), "
+            "or re-export with dimensions that are multiples of "
+            f"{TILE_SIZE}."
+        )
+    return ValidationCheck(
+        "dimensions", False,
+        f"{width}x{height}: dimensions must be multiples of {TILE_SIZE} "
+        f"(remainder {width % TILE_SIZE}px x, {height % TILE_SIZE}px y).",
+        fix,
+    )
+
+
+def _check_channels(image: Image.Image) -> ValidationCheck:
+    n_bands = _mode_channel_count(image.mode)
+    has_alpha = "A" in image.getbands()
+    if image.mode == "RGB":
+        return ValidationCheck(
+            "channels", True,
+            "3 channels (RGB): the converter's native layout.", "",
+        )
+    if has_alpha:
+        return ValidationCheck(
+            "channels", False,
+            f"{n_bands} channels ({image.mode}): an alpha channel is present "
+            "but the hardware output is opaque RGB.",
+            "flatten onto a background (composite over matte/background color) "
+            "or drop alpha -- auto-fix composites over white.",
+        )
+    if image.mode in ("L", "I", "F"):
+        return ValidationCheck(
+            "channels", False,
+            f"{n_bands} channel(s) ({image.mode}): grayscale data, expected 3 "
+            "RGB channels.",
+            "convert to RGB (grayscale is replicated across R/G/B) -- "
+            "auto-fix does this losslessly.",
+        )
+    if image.mode == "1":
+        return ValidationCheck(
+            "channels", False,
+            f"{n_bands} channel (mode '1', bilevel): expected 3 RGB channels.",
+            "convert to RGB -- auto-fix expands black/white to three channels.",
+        )
+    if image.mode == "P":
+        # Palette-indexed data is decoded to RGB before conversion; the palette
+        # itself is examined by the palette_colors check.
+        return ValidationCheck(
+            "channels", False,
+            f"{n_bands} channel (mode 'P', palette-indexed): expected 3 RGB "
+            "channels.",
+            "decode the palette to RGB (Image.convert('RGB')) -- auto-fix does "
+            "this before any conversion work.",
+        )
+    return ValidationCheck(
+        "channels", False,
+        f"{n_bands} channel(s) (mode {image.mode!r}): expected 3 RGB channels.",
+        "convert the image to RGB before conversion.",
+    )
+
+
+def _check_bit_depth(image: Image.Image) -> ValidationCheck:
+    depth = _mode_bit_depth(image.mode)
+    if depth == EXPECTED_CHANNEL_DEPTH_BITS:
+        return ValidationCheck(
+            "bit_depth", True,
+            f"{depth}-bit channels: matches the converter's 8-bit-per-channel "
+            "RGB working format.",
+            "",
+        )
+    return ValidationCheck(
+        "bit_depth", False,
+        f"{depth}-bit samples (mode {image.mode!r}): the converter works in "
+        f"{EXPECTED_CHANNEL_DEPTH_BITS}-bit channels.",
+        f"promote to {EXPECTED_CHANNEL_DEPTH_BITS}-bit RGB "
+        "(Image.convert('RGB')) -- auto-fix promotes without dithering.",
+    )
+
+
+def _check_palette_colors(image: Image.Image) -> ValidationCheck:
+    if image.mode != "P":
+        return ValidationCheck(
+            "palette_colors", True,
+            "not palette-indexed: no embedded palette to count "
+            "(colors are measured after quantization).",
+            "", applicable=False,
+        )
+    palette = image.getpalette()
+    # Prefer ImagePalette.colors (the actually allocated {rgb: index} map,
+    # present on Pillow >=9 and robust across versions -- getpalette() pads the
+    # flat list to 256 triples on the pinned Pillow 10.4). Fall back to the
+    # flat-list count only if an exotic palette lacks the mapping.
+    if getattr(image, "palette", None) is not None and getattr(
+        image.palette, "colors", None
+    ):
+        n_declared = len(image.palette.colors)
+    else:
+        n_declared = len(palette) // 3 if palette else 0
+    used_indexes = np.unique(np.asarray(image, dtype=np.uint8))
+    n_used = int(used_indexes.size)
+    if n_declared <= INPUT_PALETTE_COLOR_LIMIT:
+        return ValidationCheck(
+            "palette_colors", True,
+            f"palette-indexed image with {n_used} color(s) used of "
+            f"{n_declared} declared (limit {INPUT_PALETTE_COLOR_LIMIT}).",
+            "",
+        )
+    return ValidationCheck(
+        "palette_colors", False,
+        f"palette declares {n_declared} colors ({n_used} actually used): "
+        f"hardware palettes hold at most {INPUT_PALETTE_COLOR_LIMIT} colors "
+        "(8 palettes x 4).",
+        f"reduce the palette to <= {INPUT_PALETTE_COLOR_LIMIT} colors, or "
+        "decode to RGB and let the converter quantize -- auto-fix decodes to "
+        "RGB.",
+    )
+
+
+def validate_input(
+    image: Image.Image, *, mode: str = VALIDATION_AUTOFIX
+) -> InputValidationReport:
+    """Run the four input checks (dimensions/channels/bit depth/palette).
+
+    Read-only: never mutates ``image`` and never converts anything itself --
+    ``autofix_input`` performs the remediation. In ``VALIDATION_STRICT`` mode a
+    failing check raises :class:`InputValidationError` (wrapping the same
+    report the auto-fix mode returns); in ``VALIDATION_AUTOFIX`` mode the
+    report is always returned, with per-check fix suggestions attached.
+    """
+    if mode not in _VALIDATION_MODES:
+        raise ValueError(
+            f"unknown validation mode: {mode!r} "
+            f"(expected one of {_VALIDATION_MODES})"
+        )
+    if not isinstance(image, Image.Image):
+        raise TypeError("validate_input expects a PIL Image.Image")
+    checks = [
+        _check_dimensions(image),
+        _check_channels(image),
+        _check_bit_depth(image),
+        _check_palette_colors(image),
+    ]
+    report = InputValidationReport(
+        checks=checks,
+        passed=all(c.passed for c in checks),
+        mode=mode,
+        original_size=image.size,
+        original_mode=image.mode,
+    )
+    if mode == VALIDATION_STRICT and not report.passed:
+        raise InputValidationError(report)
+    return report
+
+
+def autofix_input(
+    image: Image.Image,
+) -> tuple:
+    """Apply the validation fix suggestions, mirroring the converter's own prep.
+
+    Returns ``(fixed_image, report)`` where ``report`` describes the *input*
+    state. The remediation deliberately repeats ``convert_for_hardware``'s
+    preprocessing byte-for-byte -- RGB conversion (alpha composited over white,
+    PIL's default flatten) then a centered crop to whole 8x8 tiles -- so
+    feeding the fixed image into the converter yields pixel-identical output to
+    feeding the original in directly. Raises :class:`InputValidationError`
+    (strict report attached) when the image is smaller than one tile after
+    trimming, since neither cropping nor conversion can produce valid input.
+    """
+    report = validate_input(image, mode=VALIDATION_AUTOFIX)
+
+    fixed = image
+    # Step 1: mode/channel/bit-depth remediation -- one RGB conversion covers
+    # grayscale, bilevel, palette-indexed and alpha inputs alike. For RGBA/LA
+    # PIL composites over an opaque white background (its documented default).
+    if not report.get_check("channels").passed or not report.get_check(
+        "bit_depth"
+    ).passed:
+        fixed = fixed.convert("RGB")
+
+    # Step 2: dimension remediation -- the same center-anchored crop the
+    # converter applies internally (left/top bias matches integer division).
+    dim_check = report.get_check("dimensions")
+    if not dim_check.passed:
+        width, height = fixed.size
+        new_w = (width // TILE_SIZE) * TILE_SIZE
+        new_h = (height // TILE_SIZE) * TILE_SIZE
+        if new_w < TILE_SIZE or new_h < TILE_SIZE:
+            # Nothing the auto-fixer can do; surface the strict-style error
+            # with the original report so every failed check stays visible.
+            raise InputValidationError(report)
+        left = (width - new_w) // 2
+        top = (height - new_h) // 2
+        fixed = fixed.crop((left, top, left + new_w, top + new_h))
+
+    return fixed, report
+
+
+# ---------------------------------------------------------------------------
 # Stage 7 / Stage 8 -- verification, render, and the public entry point
 # ---------------------------------------------------------------------------
 #
