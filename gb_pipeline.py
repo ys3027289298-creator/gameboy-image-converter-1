@@ -8,8 +8,10 @@ breakdown these functions implement.
 """
 
 import heapq
+import math
 import threading
 from dataclasses import dataclass, replace
+from time import perf_counter
 
 import numpy as np
 from PIL import Image
@@ -736,6 +738,274 @@ def pack_palettes(
     palettes_arr = np.stack(palettes).astype(np.uint8)  # (p, 4, 3)
     assignment = assign.reshape(th, tw).astype(np.uint8)
     return palettes_arr, assignment
+
+
+# ---------------------------------------------------------------------------
+# Stage 3b -- exhaustive branch-and-bound 4-color palette search
+# ---------------------------------------------------------------------------
+#
+# The k-means seeding inside pack_palettes is a local heuristic: different
+# working sets / seeds land on different 4-color palettes for the same art
+# (the "manual tweaking is unstable" symptom). This section offers the exact
+# alternative: enumerate every 4-color combination of a configurable candidate
+# set against a perceptual objective -- pixel-weighted mean Euclidean distance
+# in CIELAB, the same distance metric used throughout Stage 3 -- and return the
+# global optimum. A provable per-node lower bound prunes partial combinations
+# that cannot beat the incumbent, so exact optimality is retained while most
+# of the combination tree is never expanded. Nothing above in the pipeline is
+# touched: fixed/custom-palette outputs stay byte-for-byte unchanged.
+
+
+@dataclass
+class PaletteSearchResult:
+    """Outcome of :func:`search_four_color_palette`.
+
+    ``timed_out`` is always paired with a clear ``status``: ``"optimal"`` when
+    the full tree was searched, ``"timeout"`` when the deadline expired (the
+    returned palette is then the best found in the budget, or None), and
+    ``"optimal_within_tolerance"`` when a non-zero ``tolerance`` allowed a
+    provably near-optimal early stop.
+    """
+
+    palette: np.ndarray | None       # (4, 3) uint8, RGB555, luminance-sorted
+    mean_delta_e: float              # pixel-weighted mean CIELAB dE of palette
+    total_delta_e: float             # pixel-count-weighted dE sum
+    status: str                      # "optimal" | "optimal_within_tolerance" | "timeout"
+    timed_out: bool
+    nodes_evaluated: int             # tree nodes actually entered (incl. root)
+    leaves_evaluated: int            # full 4-color combinations fully scored
+    nodes_pruned: int                # subtrees discarded on the lower bound
+    nodes_total: int                 # nodes an unpruned enumeration would visit
+    elapsed_seconds: float
+    candidate_count: int
+    tolerance: float
+    time_limit_seconds: float | None
+
+
+def palette_mean_delta_e(
+    image: np.ndarray | Image.Image, palette: np.ndarray
+) -> float:
+    """Pixel-weighted mean Euclidean CIELAB distance from an image to a palette.
+
+    Each pixel is matched to its nearest palette entry (the same mapping
+    ``index_tiles`` performs); the returned value is the pixel-count-weighted
+    mean over the image. This is the objective ``search_four_color_palette``
+    minimizes, exposed so a hand-tuned palette can be scored on the same scale.
+    """
+    src_lab, _, weights = _image_weighted_colors(image)
+    pal = snap_rgb555(np.asarray(palette, dtype=np.uint8).reshape(-1, 3))
+    pal = np.unique(pal, axis=0)
+    pal_lab = _rgb_to_lab(pal)
+    d = np.sqrt(((src_lab[:, None, :] - pal_lab[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+    return float((d * weights).sum() / weights.sum())
+
+
+def _image_weighted_colors(image: np.ndarray | Image.Image) -> tuple:
+    """Flatten an RGB image/array to (unique Lab colors, unique RGB rows, weights)."""
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    arr = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
+    rgb, counts = np.unique(arr, axis=0, return_counts=True)
+    return _rgb_to_lab(rgb), rgb, counts.astype(np.float64)
+
+
+def search_four_color_palette(
+    image: np.ndarray | Image.Image,
+    candidates: np.ndarray,
+    *,
+    tolerance: float = 0.0,
+    time_limit: float | None = None,
+    enable_pruning: bool = True,
+    warm_start: np.ndarray | None = None,
+    k: int = 4,
+) -> PaletteSearchResult:
+    """Exhaustive branch-and-bound search for the best ``k``-color palette.
+
+    Every combination of ``k`` distinct entries of ``candidates`` is a feasible
+    palette; the objective is the pixel-weighted mean Euclidean CIELAB distance
+    (mean dE) from the image's pixels to their nearest chosen entry. With
+    ``tolerance=0`` (default) the returned palette is the provable global
+    optimum over the candidate set.
+
+    Pruning (lower bound). At a partial node with ``s`` candidates chosen and
+    ``m = k - s`` slots left, ``current`` holds every pixel's weighted
+    distance to its nearest chosen entry. Adding a candidate ``j`` can improve
+    pixel ``i`` by at most ``max(0, current[i] - wdist[i, j])``; charging each
+    improved pixel to whichever added candidate ends up serving it proves the
+    total improvement of any completion is at most the sum of the ``m``
+    largest per-candidate charge groups. Hence::
+
+        LB(node) = current.sum() - sum(top-m charge groups among not-chosen)
+
+    is a lower bound on every descendant's objective. A node is discarded when
+    ``LB >= best - tolerance``: with ``tolerance > 0`` the result is allowed to
+    be at most ``tolerance`` mean-dE worse than the optimum, and ``status``
+    says so.
+
+    Both the candidate set and the pruning tolerance are caller-configurable.
+    ``time_limit`` (seconds, wall clock) bounds the search: on expiry the best
+    palette found within the budget is returned with ``status="timeout"`` and
+    ``timed_out=True`` (or a None palette if nothing was scored). ``warm_start``
+    seeds the incumbent from a hand-tuned palette so pruning bites immediately.
+    ``enable_pruning=False`` runs the unpruned enumeration, which is what makes
+    the pre/post-pruning node counts comparable.
+    """
+    tolerance = float(tolerance)
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0")
+    if time_limit is not None and float(time_limit) < 0.0:
+        raise ValueError("time_limit must be >= 0")
+    k = int(k)
+    if k < 1:
+        raise ValueError("k must be >= 1")
+
+    t_start = perf_counter()
+    deadline = None if time_limit is None else t_start + float(time_limit)
+    # A deadline already in the past (including a 0.0 budget) must report the
+    # timeout before any leaf is scored, so callers can rely on a None
+    # palette meaning "nothing feasible was evaluated within the budget".
+    pre_expired = deadline is not None and perf_counter() >= deadline
+
+    src_lab, _, weights = _image_weighted_colors(image)
+    total_weight = float(weights.sum())
+
+    cand = snap_rgb555(np.asarray(candidates, dtype=np.uint8).reshape(-1, 3))
+    cand = np.unique(cand, axis=0)
+    n_cand = len(cand)
+    if n_cand < k:
+        raise ValueError(f"need at least {k} distinct candidates, got {n_cand}")
+
+    # (n_src, n_cand) Euclidean Lab distance from every source color to every
+    # candidate. Everything downstream is table lookups / sums on this matrix.
+    src_dist = np.sqrt(
+        ((src_lab[:, None, :] - _rgb_to_lab(cand)[None, :, :]) ** 2).sum(axis=2)
+    )
+    nearest_idx = np.argmin(src_dist, axis=1)
+
+    # Each candidate's full-set gain group: total weighted distance of the
+    # pixels for which it is the nearest candidate. Used only to order the
+    # DFS so the most promising candidates establish a tight incumbent early.
+    gains = np.zeros(n_cand, dtype=np.float64)
+    np.add.at(gains, nearest_idx, src_dist[np.arange(len(src_lab)), nearest_idx] * weights)
+    order = np.argsort(-gains, kind="stable")
+    cand = cand[order]
+    cand_lab = _rgb_to_lab(cand)
+    wdist = (src_dist * weights[:, None])[:, order]
+
+    # Warm-start incumbent from a hand-tuned palette (mapped onto the snapped
+    # candidate set so an off-grid warm start is still legal).
+    best_score = np.inf
+    best_combo: tuple | None = None
+    if warm_start is not None:
+        ws = snap_rgb555(np.asarray(warm_start, dtype=np.uint8).reshape(-1, 3))
+        ws = np.unique(ws, axis=0)
+        if len(ws) >= k:
+            ws_lab = _rgb_to_lab(ws)
+            # Each candidate (already in DFS order) takes its nearest
+            # warm-start shade; the k shades that the most candidates map to
+            # supply a legal incumbent chosen entirely from the candidate set.
+            pick = np.argmin(
+                ((_rgb_to_lab(cand)[:, None, :] - ws_lab[None, :, :]) ** 2).sum(axis=2),
+                axis=1,
+            )
+            group_mass = np.bincount(pick, minlength=len(ws))
+            keep = set(np.argsort(-group_mass, kind="stable")[:k].tolist())
+            chosen = tuple(sorted(j for j in range(n_cand) if int(pick[j]) in keep))[:k]
+            if len(chosen) == k:
+                sel = np.array(list(chosen))
+                score = float(wdist[:, sel].min(axis=1).sum())
+                if score < best_score:
+                    best_score, best_combo = score, chosen
+
+    # Nodes an unpruned DFS actually enters: the root plus every feasible
+    # prefix combination. The DFS only takes strictly increasing index picks,
+    # so a size-s prefix is feasible when at least k-s candidates remain after
+    # its last pick -- sum over the feasible last-index positions.
+    feasible = 1
+    for s in range(1, k + 1):
+        feasible += int(sum(math.comb(last, s - 1) for last in range(s - 1, n_cand - k + s)))
+    nodes_total = feasible
+
+    stats = {"evaluated": 0, "leaves": 0, "pruned": 0}
+    timed_out = False
+
+    def dfs(start: int, chosen: tuple, current: np.ndarray) -> None:
+        nonlocal best_score, best_combo, timed_out
+        if timed_out:
+            return
+        stats["evaluated"] += 1
+        if stats["evaluated"] & 0xFF == 0 and deadline is not None:
+            if perf_counter() >= deadline:
+                timed_out = True
+                return
+
+        slots = k - len(chosen)
+        if slots == 0:
+            stats["leaves"] += 1
+            score = float(current.sum())
+            if score < best_score - 1e-12:
+                best_score, best_combo = score, chosen
+            return
+
+        if enable_pruning and best_combo is not None:
+            # Charge bound. For every not-chosen candidate j, Q[j] is the
+            # total weighted distance it would shave off the current node's
+            # residuals. Any completion adds exactly `slots` candidates;
+            # charging each improved pixel to the candidate that serves it in
+            # the final palette means its total improvement can never exceed
+            # the sum of the `slots` largest Q groups -- so current.sum()
+            # minus that sum lower-bounds every descendant's objective.
+            mask = np.ones(n_cand, dtype=bool)
+            if chosen:
+                mask[np.array(chosen, dtype=np.int64)] = False
+            improvement = np.maximum(current[:, None] - wdist, 0.0)
+            q = improvement[:, mask].sum(axis=0)
+            top_gain = float(np.sort(q)[-slots:].sum()) if len(q) >= slots else float(q.sum())
+            lower_bound = float(current.sum()) - top_gain
+            if lower_bound >= best_score - tolerance - 1e-12:
+                stats["pruned"] += 1
+                return
+
+        for j in range(start, n_cand):
+            if n_cand - j < slots:
+                break  # not enough candidates left to fill the palette
+            dfs(j + 1, chosen + (j,), np.minimum(current, wdist[:, j]))
+
+    if pre_expired:
+        timed_out = True
+    else:
+        dfs(0, (), np.full(len(src_lab), np.inf, dtype=np.float64))
+    elapsed = perf_counter() - t_start
+
+    if timed_out:
+        status = "timeout"
+        palette = None if best_combo is None else _finalize_search_palette(cand, best_combo)
+        mean_de = np.inf if best_combo is None else best_score / total_weight
+    else:
+        status = "optimal_within_tolerance" if tolerance > 0.0 else "optimal"
+        palette = _finalize_search_palette(cand, best_combo)
+        mean_de = best_score / total_weight
+    return PaletteSearchResult(
+        palette=palette,
+        mean_delta_e=float(mean_de),
+        total_delta_e=float(best_score if np.isfinite(best_score) else np.inf),
+        status=status,
+        timed_out=timed_out,
+        nodes_evaluated=stats["evaluated"],
+        leaves_evaluated=stats["leaves"],
+        nodes_pruned=stats["pruned"],
+        nodes_total=nodes_total,
+        elapsed_seconds=float(elapsed),
+        candidate_count=n_cand,
+        tolerance=tolerance,
+        time_limit_seconds=None if time_limit is None else float(time_limit),
+    )
+
+
+def _finalize_search_palette(cand_snapped: np.ndarray, combo: tuple) -> np.ndarray:
+    """Map search-space indices back to RGB and return the (4,3) GB palette."""
+    palette = cand_snapped[np.array(combo, dtype=np.int64)]
+    return luminance_sort(snap_rgb555(_pad4(palette))).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
