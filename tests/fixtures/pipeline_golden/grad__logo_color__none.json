@@ -1,0 +1,67 @@
+{
+  "dither": "none",
+  "image": "grad",
+  "palette_hex": [
+    [
+      "#84084A",
+      "#52103A",
+      "#290821",
+      "#081008"
+    ],
+    [
+      "#D64A9C",
+      "#E63AA5",
+      "#F7199C",
+      "#D6087B"
+    ],
+    [
+      "#108442",
+      "#CE3A21",
+      "#733A52",
+      "#083119"
+    ],
+    [
+      "#4AAD73",
+      "#6B9484",
+      "#7B5A6B",
+      "#844A73"
+    ],
+    [
+      "#7BEFAD",
+      "#4AE694",
+      "#21E673",
+      "#19B55A"
+    ],
+    [
+      "#E6EFE6",
+      "#ADF7C5",
+      "#F7ADD6",
+      "#294AC5"
+    ],
+    [
+      "#DE73AD",
+      "#9C6384",
+      "#A54284",
+      "#AD196B"
+    ]
+  ],
+  "preset": "logo_color",
+  "stats": {
+    "colors_target": 28,
+    "colors_used": 28,
+    "dither": "none",
+    "gbstudio_corrupted_tiles": 0,
+    "gbstudio_palettes_extracted": 8,
+    "gbstudio_recolored_tiles": 34,
+    "gbstudio_tiles": 211,
+    "n_merges": 0,
+    "p95_delta_e": 0.0,
+    "palettes_used": 7,
+    "preset": "logo_color",
+    "tile_budget": null,
+    "tiles_used": 360
+  },
+  "warnings": [
+    "Input resized to 160x144 for the logo_color preset."
+  ]
+}

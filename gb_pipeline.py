@@ -1554,14 +1554,15 @@ class _ConformResult:
     exhausted: bool          # fallback ladder ran out (safety net; unexpected)
 
 
-def _conform_to_gbstudio(pack_stage, ps: Preset, budget, n_palettes: int) -> _ConformResult:
+def _conform_to_gbstudio(ctx, ps: Preset, budget, n_palettes: int) -> _ConformResult:
     """Conform the rendered candidate to GB Studio v4.3.2's real importer.
 
-    ``pack_stage(n_pal)`` re-runs the candidate-generation stages
-    (quantize/pack/index/dedup) for ``n_pal`` master palettes and returns the
-    pre-merge GBImage; it is memoized by the caller so the tile loop, which only
-    tightens the merge target, does not repack. The shipped PNG is then
-    pixel-exact what GB reconstructs on import (corruption 0 by construction).
+    ``_run_candidate(ctx, n_pal)`` re-runs the candidate-generation stages
+    (quantize/palette_map/dither/dedup) for ``n_pal`` master palettes and
+    returns the pre-merge GBImage; it is memoized on the context so the tile
+    loop, which only tightens the merge target, does not repack. The shipped
+    PNG is then pixel-exact what GB reconstructs on import (corruption 0 by
+    construction).
 
     Control flow (design 2026-07-08):
 
@@ -1582,17 +1583,10 @@ def _conform_to_gbstudio(pack_stage, ps: Preset, budget, n_palettes: int) -> _Co
     no flips) -- no palettes/recoloring.
     """
     is_logo = ps.fixed_size is not None
-    _pre: dict = {}
 
     def candidate(target, n_pal):
-        pre_gb = _pre.get(n_pal)
-        if pre_gb is None:
-            pre_gb = pack_stage(n_pal)
-            _pre[n_pal] = pre_gb
-        if is_logo or budget is None:
-            gb, n_merges = pre_gb, 0
-        else:
-            gb, n_merges = merge_to_budget(pre_gb, target, ps.allow_flips)
+        pre_gb = _run_candidate(ctx, n_pal)
+        gb, n_merges = _run_merge(ctx, pre_gb, target)
         arr = np.asarray(render(gb), dtype=np.uint8)
         p95 = float(getattr(gb, "merge_p95_delta_e", 0.0))
         return gb, arr, n_merges, p95
@@ -1649,41 +1643,69 @@ def _conform_to_gbstudio(pack_stage, ps: Preset, budget, n_palettes: int) -> _Co
     return replace(last, exhausted=True)
 
 
-def convert_for_hardware(
-    image: Image.Image,
-    preset: str,
-    *,
-    tile_budget: int | None = None,
-    reserve_ui_palette: bool = True,
-    dither: str = "none",
-    custom_palette: np.ndarray | None = None,
-    mono_ramp: np.ndarray | None = None,
-    max_colors: int | None = None,
-) -> ConversionResult:
-    """Convert ``image`` to a GB Studio-importable render for a named preset.
+# ---------------------------------------------------------------------------
+# Composable pipeline engine
+# ---------------------------------------------------------------------------
+#
+# The conversion flow is wired as a set of named, independently switchable
+# stages. A pipeline config (see DEFAULT_PIPELINE_CONFIG) lists the stages to
+# run; the engine validates it (unknown stages, unmet requirements, dependency
+# cycles), topologically sorts the stages from their requires/provides edges
+# plus any explicit after/before constraints, and runs them over a shared
+# context. ``convert_for_hardware`` runs the default config, which reproduces
+# the original hardcoded flow bit for bit; ``convert_with_pipeline`` accepts a
+# custom config.
+#
+# Stage groups: "main" stages run once, in dependency order. "candidate"
+# stages (quantize -> palette_map -> dither -> dedup) build one pre-merge
+# GBImage candidate and are re-run by the conform stage for each master
+# palette count it tries (memoized per run). "merge" stages (merge_budget)
+# are re-run by the conform stage for each tile target it tries.
 
-    ``preset`` is a key of ``PRESETS``. Runs the full pipeline: RGB-convert,
-    crop to multiples of 8 (logo presets are resized to their fixed size),
-    quantize to a bounded working set, pack palettes, index tiles (mono uses
-    the ramp path), losslessly dedup (skipped for logo), lossily merge to the
-    tile budget (skipped for logo / no budget), then verify and render.
-    ``reserve_ui_palette`` reserves palette 8 for the dialogue/UI palette by
-    reducing an 8-palette color preset to 7. ``max_colors`` (color presets
-    only; ignored for mono) is a target for the total distinct colors across
-    all palettes: it is clamped to the hardware ceiling (32, or 28 with the UI
-    palette reserved -- with a warning), the palette count becomes
-    ``ceil(max_colors / 4)``, and a budget that is not a whole number of
-    palettes is enforced by folding the surplus colors together. ``None``
-    means "use everything the hardware allows". Returns a ConversionResult with
-    the final and pre-merge reference images, verified stats, warnings, and
-    per-palette hex swatches.
+
+class PipelineConfigError(ValueError):
+    """Raised for a malformed pipeline config.
+
+    Covers unknown stage names, duplicate stages, unknown stage parameters,
+    requirements no enabled stage provides, dangling after/before
+    constraints, and cyclic dependencies. Subclasses ValueError so callers
+    that already treat bad input as ValueError keep working.
     """
-    if preset not in PRESETS:
-        raise ValueError(f"unknown preset: {preset!r}")
-    ps = PRESETS[preset]
-    warnings: list = []
 
-    img = image.convert("RGB")
+
+class _PipelineCtx:
+    """Mutable attribute bag shared by all stages of one conversion run."""
+
+
+@dataclass
+class _StageDef:
+    """Registry entry for one pipeline stage."""
+
+    func: object                 # callable(ctx, params)
+    requires: tuple = ()         # context keys an enabled stage must provide
+    optional_requires: tuple = ()  # ordering edges only when a provider is enabled
+    provides: tuple = ()         # context keys this stage sets
+    group: str = "main"          # main | candidate | merge
+    params: tuple = ()           # allowed per-stage parameter names
+
+
+@dataclass
+class _ResolvedStage:
+    name: str
+    params: dict
+
+
+# --- Stage implementations --------------------------------------------------
+#
+# Each stage reads its inputs from / writes its outputs to the shared context.
+# The default wiring reproduces the original hardcoded convert_for_hardware
+# body statement for statement.
+
+
+def _stage_prepare(ctx, params):
+    """Input prep: RGB convert, crop to 8px multiples, logo resize, budgets."""
+    ps = ctx.ps
+    img = ctx.image.convert("RGB")
     is_logo = ps.fixed_size is not None
 
     # Crop down to multiples of 8 (notice if it changed anything).
@@ -1695,7 +1717,7 @@ def convert_for_hardware(
         left = (ow - nw) // 2
         top = (oh - nh) // 2
         img = img.crop((left, top, left + nw, top + nh))
-        warnings.append(
+        ctx.warnings.append(
             f"Input center-cropped from {ow}x{oh} to {nw}x{nh} "
             "(dimensions must be multiples of 8)."
         )
@@ -1705,11 +1727,11 @@ def convert_for_hardware(
         fw, fh = ps.fixed_size
         if img.size != (fw, fh):
             img = img.resize((fw, fh), Image.LANCZOS)
-            warnings.append(f"Input resized to {fw}x{fh} for the {ps.name} preset.")
+            ctx.warnings.append(f"Input resized to {fw}x{fh} for the {ps.name} preset.")
 
     # Effective palette budget: reserve palette 8 for color presets.
     n_palettes = ps.n_palettes
-    if reserve_ui_palette and not ps.mono and n_palettes >= 8:
+    if ctx.reserve_ui_palette and not ps.mono and n_palettes >= 8:
         n_palettes -= 1
 
     # Color budget (color presets): the hardware ceiling is 4 colors per
@@ -1719,19 +1741,19 @@ def convert_for_hardware(
     color_cap = None  # None => no extra cap beyond whole palettes
     if ps.mono:
         target_colors = None
-    elif max_colors is None:
+    elif ctx.max_colors is None:
         target_colors = hw_max_colors
     else:
-        target_colors = max(1, int(max_colors))
+        target_colors = max(1, int(ctx.max_colors))
         if target_colors > hw_max_colors:
-            if reserve_ui_palette and ps.n_palettes >= 8 and target_colors <= 4 * ps.n_palettes:
-                warnings.append(
+            if ctx.reserve_ui_palette and ps.n_palettes >= 8 and target_colors <= 4 * ps.n_palettes:
+                ctx.warnings.append(
                     f"Requested {target_colors} colors but palette 8 is reserved "
                     f"for dialogue/UI, so output is capped at {hw_max_colors} "
                     "(untick the reserve option to use all 32)."
                 )
             else:
-                warnings.append(
+                ctx.warnings.append(
                     f"Requested {target_colors} colors exceeds this preset's "
                     f"hardware limit; capped at {hw_max_colors} "
                     f"({n_palettes} palettes x 4)."
@@ -1741,63 +1763,135 @@ def convert_for_hardware(
         if target_colors < 4 * n_palettes:
             color_cap = target_colors
 
-    if custom_palette is not None and not ps.mono:
+    if ctx.custom_palette is not None and not ps.mono:
         k = int(np.unique(
-            snap_rgb555(np.asarray(custom_palette, dtype=np.uint8).reshape(-1, 3)),
+            snap_rgb555(np.asarray(ctx.custom_palette, dtype=np.uint8).reshape(-1, 3)),
             axis=0).shape[0])
         if k < target_colors:
-            warnings.append(
+            ctx.warnings.append(
                 f"Custom palette restricts output to {k} colors (this preset "
                 f"supports up to {target_colors}). The right pane shows the "
                 "converter's own choices."
             )
 
-    orig_arr = np.asarray(img, dtype=np.uint8)
-    budget = tile_budget if tile_budget is not None else ps.tile_budget
+    ctx.img = img
+    ctx.n_palettes = n_palettes
+    ctx.color_cap = color_cap
+    ctx.target_colors = target_colors
+    ctx.orig_arr = np.asarray(img, dtype=np.uint8)
+    ctx.budget = ctx.tile_budget if ctx.tile_budget is not None else ps.tile_budget
 
-    # Candidate generation (quantize/pack/index/dedup) as a re-runnable stage so
-    # the conform loop can retry at a tightened tile target or with fewer master
-    # palettes without redoing the input prep above. Memoized by n_pal (the tile
-    # loop only re-merges the cached pre-merge candidate).
-    _pack_cache: dict = {}
 
-    def pack_stage(n_pal):
-        cached = _pack_cache.get(n_pal)
-        if cached is not None:
-            return cached
-        if ps.mono:
-            # Mono skips the working-set quantizer entirely: the luminance path
-            # dithers continuous tone straight to the 4-level ramp (n_pal n/a).
-            ramp = DMG_RAMP if mono_ramp is None else np.asarray(mono_ramp, dtype=np.uint8)
-            pals, _ = pack_palettes_mono(orig_arr, ramp)
-            g = _index_tiles_mono(orig_arr, pals, dither)
-        else:
-            quantized = quantize_working_set(
-                img, min(4 * n_pal * WORKING_SET_FACTOR, 128), custom_palette
-            )
-            a = np.asarray(quantized, dtype=np.uint8)
-            pals, assignment = pack_palettes(a, n_pal, custom_palette)
-            if color_cap is not None:
-                pals = cap_palette_colors(
-                    pals, a, color_cap, allow_new_colors=custom_palette is None
-                )
-            # Palette packing runs on the quantized working set, but per-pixel
-            # indexing/dithering reads the ORIGINAL pixels so nearest-entry
-            # mapping and Bayer dithering see real gradients instead of the
-            # quantizer's coarse steps.
-            g = index_tiles(orig_arr, pals, assignment, dither)
-        if not is_logo:
-            g = dedup_patterns(g, ps.allow_flips)
-        _pack_cache[n_pal] = g
-        return g
+def _stage_quantize(ctx, params):
+    """Reduce the image to a bounded RGB555 working set (color presets only).
 
-    # Pre-merge reference render (natural, un-conformed compare) -- unchanged.
-    reference_gb = pack_stage(n_palettes)
+    Mono deliberately skips the working-set quantizer so ordered dithering
+    sees continuous tone.
+    """
+    if ctx.ps.mono:
+        ctx.working_set = None
+        return
+    quantized = quantize_working_set(
+        ctx.img, min(4 * ctx.n_pal * WORKING_SET_FACTOR, 128), ctx.custom_palette
+    )
+    ctx.working_set = np.asarray(quantized, dtype=np.uint8)
+
+
+def _stage_palette_map(ctx, params):
+    """Fit <= n_pal 4-color palettes and assign one to each 8x8 tile."""
+    ps = ctx.ps
+    if ps.mono:
+        ramp = DMG_RAMP if ctx.mono_ramp is None else np.asarray(ctx.mono_ramp, dtype=np.uint8)
+        pals, _ = pack_palettes_mono(ctx.orig_arr, ramp)
+        ctx.pals = pals
+        ctx.assignment = None
+        return
+    # With the quantize stage disabled, pack straight from the raw pixels.
+    working_set = getattr(ctx, "working_set", None)
+    a = working_set if working_set is not None else ctx.orig_arr
+    pals, assignment = pack_palettes(a, ctx.n_pal, ctx.custom_palette)
+    if ctx.color_cap is not None:
+        pals = cap_palette_colors(
+            pals, a, ctx.color_cap, allow_new_colors=ctx.custom_palette is None
+        )
+    ctx.pals = pals
+    ctx.assignment = assignment
+
+
+def _stage_dither(ctx, params):
+    """Index pixels to their tile's palette, optionally Bayer-dithered.
+
+    Palette packing runs on the quantized working set, but per-pixel
+    indexing/dithering reads the ORIGINAL pixels so nearest-entry mapping and
+    Bayer dithering see real gradients instead of the quantizer's coarse
+    steps. ``params["mode"]`` ("none"/"bayer") overrides the caller's dither
+    argument when given.
+    """
+    mode = params.get("mode") or ctx.dither
+    if ctx.ps.mono:
+        ctx.gb = _index_tiles_mono(ctx.orig_arr, ctx.pals, mode)
+    else:
+        ctx.gb = index_tiles(ctx.orig_arr, ctx.pals, ctx.assignment, mode)
+    ctx.effective_dither = mode
+
+
+def _stage_dedup(ctx, params):
+    """Losslessly collapse duplicate (and flip-equivalent) patterns.
+
+    Logo presets store tiles sequentially and are exempt.
+    """
+    if ctx.ps.fixed_size is None:
+        ctx.gb = dedup_patterns(ctx.gb, ctx.ps.allow_flips)
+
+
+def _stage_merge_budget(ctx, params):
+    """Lossily merge patterns down to the merge target (see Stage 6).
+
+    Logo presets and budget-less presets are exempt (GB exempts logo tiles
+    from its dedup); ``ctx.n_merges`` stays 0 in that case.
+    """
+    ps = ctx.ps
+    if ps.fixed_size is not None or ctx.budget is None:
+        return
+    ctx.gb, ctx.n_merges = merge_to_budget(ctx.gb, ctx.merge_target, ps.allow_flips)
+
+
+def _stage_conform(ctx, params):
+    """Produce the final GBImage, conformed to GB Studio's real importer.
+
+    With ``params["oracle"]`` false, skips the GB Studio importer loop and
+    ships a single candidate merged straight to the budget (fast preview;
+    the export stage still runs the structural round-trip verification).
+    """
+    ps = ctx.ps
+    if params.get("oracle", True):
+        ctx.cr = _conform_to_gbstudio(ctx, ps, ctx.budget, ctx.n_palettes)
+        return
+    pre_gb = _run_candidate(ctx, ctx.n_palettes)
+    gb, n_merges = _run_merge(ctx, pre_gb, ctx.budget)
+    arr = np.asarray(render(gb), dtype=np.uint8)
+    ctx.cr = _ConformResult(
+        gb=gb, image=arr, base_image=arr,
+        tiles=int(gb.patterns.shape[0]),
+        palettes_extracted=int(gb.palettes.shape[0]),
+        corrupted_tiles=0, n_recolored=0,
+        n_merges=n_merges, p95=float(getattr(gb, "merge_p95_delta_e", 0.0)),
+        n_pal_final=ctx.n_palettes, exhausted=False,
+    )
+
+
+def _stage_export(ctx, params):
+    """Render, verify, and pack the ConversionResult (the export stage)."""
+    ps = ctx.ps
+    warnings = ctx.warnings
+    budget = ctx.budget
+    n_palettes = ctx.n_palettes
+
+    # Pre-merge reference render (natural, un-conformed compare).
+    reference_gb = _run_candidate(ctx, n_palettes)
     reference_img = render(reference_gb)
 
-    # Oracle-in-the-loop conformance: tighten tiles / recolor palettes until GB
-    # Studio's own importer measures the shipped PNG as GB-legal (corruption 0).
-    cr = _conform_to_gbstudio(pack_stage, ps, budget, n_palettes)
+    cr = ctx.cr
     final_gb = cr.gb
     final_img = Image.fromarray(cr.image, "RGB")
 
@@ -1836,18 +1930,18 @@ def convert_for_hardware(
         "tile_budget": budget,
         "palettes_used": int(final_gb.palettes.shape[0]),
         "colors_used": count_palette_colors(final_gb.palettes),
-        "colors_target": target_colors,
+        "colors_target": ctx.target_colors,
         "n_merges": int(n_merges),
         "p95_delta_e": p95,
         "preset": ps.name,
-        "dither": dither,
+        "dither": ctx.effective_dither,
     }
 
     if ps.mono:
         # A custom mono ramp whose shades share a GB Studio green bucket would
         # silently merge on import (its fixed 65/130/205 thresholds ignore our
         # ramp); warn on the stored (as-imported) ramp.
-        if mono_ramp is not None:
+        if ctx.mono_ramp is not None:
             buckets = gb_studio_import.mono_ramp_green_buckets(final_gb.palettes[0])
             if len(set(buckets)) < len(buckets):
                 warnings.append(
@@ -1873,10 +1967,414 @@ def convert_for_hardware(
             gs_warnings, _ = gb_studio_import.gbstudio_report(gs_stats, budget)
             warnings.extend(gs_warnings)
 
-    return ConversionResult(
+    ctx.result = ConversionResult(
         image=final_img,
         reference=reference_img,
         stats=stats,
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
+    )
+
+
+_STAGE_REGISTRY = {
+    "prepare": _StageDef(
+        _stage_prepare,
+        provides=("img", "orig_arr", "budget", "n_palettes", "color_cap",
+                  "target_colors"),
+        group="main",
+    ),
+    "quantize": _StageDef(
+        _stage_quantize,
+        requires=("img",),
+        provides=("working_set",),
+        group="candidate",
+    ),
+    "palette_map": _StageDef(
+        _stage_palette_map,
+        requires=("orig_arr",),
+        optional_requires=("working_set",),
+        provides=("pals", "assignment"),
+        group="candidate",
+    ),
+    "dither": _StageDef(
+        _stage_dither,
+        requires=("orig_arr", "pals"),
+        provides=("gb",),
+        group="candidate",
+        params=("mode",),
+    ),
+    "dedup": _StageDef(
+        _stage_dedup,
+        requires=("gb",),
+        provides=("gb",),
+        group="candidate",
+    ),
+    "merge_budget": _StageDef(
+        _stage_merge_budget,
+        requires=("gb", "budget"),
+        group="merge",
+    ),
+    "conform": _StageDef(
+        _stage_conform,
+        requires=("budget", "n_palettes"),
+        provides=("cr",),
+        group="main",
+        params=("oracle",),
+    ),
+    "export": _StageDef(
+        _stage_export,
+        requires=("cr", "n_palettes"),
+        provides=("result",),
+        group="main",
+    ),
+}
+
+# The default pipeline: exactly the stages of the original hardcoded
+# convert_for_hardware flow, in the original order. Verified pixel-identical
+# against pre-refactor goldens by tests/test_pipeline.py.
+DEFAULT_PIPELINE_CONFIG = {
+    "stages": [
+        {"stage": "prepare"},      # RGB convert, crop/resize, budgets
+        {"stage": "quantize"},     # bounded RGB555 working set (color presets)
+        {"stage": "palette_map"},  # fit <= n 4-color palettes, assign per tile
+        {"stage": "dither"},       # index pixels to palettes (+Bayer dither)
+        {"stage": "dedup"},        # lossless pattern dedup (flips if allowed)
+        {"stage": "merge_budget"}, # lossy merge down to the tile budget
+        {"stage": "conform"},      # GB Studio importer-in-the-loop conformance
+        {"stage": "export"},       # render, verify, stats -> ConversionResult
+    ]
+}
+
+
+# --- Config resolution ------------------------------------------------------
+
+
+def _normalize_config(config) -> list:
+    """Normalize a pipeline config to a list of stage spec dicts."""
+    if config is None:
+        config = DEFAULT_PIPELINE_CONFIG
+    if isinstance(config, (list, tuple)):
+        config = {"stages": list(config)}
+    if not isinstance(config, dict) or not isinstance(
+        config.get("stages"), (list, tuple)
+    ):
+        raise PipelineConfigError(
+            "pipeline config must be a mapping with a 'stages' list, or a "
+            "bare list of stage entries"
+        )
+    specs = []
+    for entry in config["stages"]:
+        if isinstance(entry, str):
+            entry = {"stage": entry}
+        if not isinstance(entry, dict) or "stage" not in entry:
+            raise PipelineConfigError(
+                "each stage entry must be a stage name or a mapping with a "
+                f"'stage' key; got {entry!r}"
+            )
+        specs.append(
+            {
+                "stage": entry["stage"],
+                "enabled": bool(entry.get("enabled", True)),
+                "params": dict(entry.get("params") or {}),
+                "after": list(entry.get("after") or ()),
+                "before": list(entry.get("before") or ()),
+            }
+        )
+    return specs
+
+
+def _topo_sort(names, edges, pos):
+    """Kahn's algorithm; config order breaks ties. None if a cycle remains."""
+    indeg = {n: 0 for n in names}
+    for src, succs in edges.items():
+        for dst in succs:
+            indeg[dst] += 1
+    heap = [(pos[n], n) for n in names if indeg[n] == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        _, n = heapq.heappop(heap)
+        order.append(n)
+        for dst in edges[n]:
+            indeg[dst] -= 1
+            if indeg[dst] == 0:
+                heapq.heappush(heap, (pos[dst], dst))
+    return order if len(order) == len(names) else None
+
+
+def _find_cycle(names, edges) -> list:
+    """One concrete dependency cycle among ``names`` (for the error message)."""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in names}
+    stack = []
+
+    def dfs(u):
+        color[u] = GRAY
+        stack.append(u)
+        for v in sorted(edges[u]):
+            if v not in color:
+                continue
+            if color[v] == GRAY:
+                return stack[stack.index(v):] + [v]
+            if color[v] == WHITE:
+                found = dfs(v)
+                if found:
+                    return found
+        stack.pop()
+        color[u] = BLACK
+        return None
+
+    for n in names:
+        if color[n] == WHITE:
+            found = dfs(n)
+            if found:
+                return found
+    return list(names)  # unreachable in practice
+
+
+def _resolve_pipeline(config) -> dict:
+    """Validate ``config`` and return the resolved execution plan.
+
+    Raises PipelineConfigError for unknown/duplicate stages, unknown stage
+    parameters, requirements no enabled stage provides, dangling after/before
+    constraints, and cyclic dependencies.
+    """
+    specs = _normalize_config(config)
+    names = [s["stage"] for s in specs]
+    unknown = [n for n in names if n not in _STAGE_REGISTRY]
+    if unknown:
+        raise PipelineConfigError(
+            f"unknown pipeline stage(s): {', '.join(repr(n) for n in unknown)}. "
+            f"Available stages: {', '.join(sorted(_STAGE_REGISTRY))}."
+        )
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise PipelineConfigError(
+            f"duplicate pipeline stage(s): {', '.join(repr(n) for n in dupes)}"
+        )
+    for s in specs:
+        allowed = _STAGE_REGISTRY[s["stage"]].params
+        bad = sorted(k for k in s["params"] if k not in allowed)
+        if bad:
+            hint = f" (allowed: {', '.join(allowed)})" if allowed else ""
+            raise PipelineConfigError(
+                f"stage {s['stage']!r} got unknown parameter(s): "
+                f"{', '.join(repr(k) for k in bad)}{hint}"
+            )
+
+    enabled = [s for s in specs if s["enabled"]]
+    pos = {s["stage"]: i for i, s in enumerate(enabled)}
+
+    def provider_for(key, self_name):
+        """The enabled stage that provides ``key``: nearest preceding in the
+        config list, else nearest following (dependencies trump list order)."""
+        cands = [
+            s["stage"] for s in enabled
+            if key in _STAGE_REGISTRY[s["stage"]].provides
+            and s["stage"] != self_name
+        ]
+        if not cands:
+            return None
+        before = [c for c in cands if pos[c] < pos[self_name]]
+        if before:
+            return max(before, key=lambda c: pos[c])
+        return min(cands, key=lambda c: pos[c])
+
+    edges = {s["stage"]: set() for s in enabled}  # name -> successors
+    reasons = []  # (src, dst, why) in insertion order, for describe_pipeline
+
+    def add_edge(src, dst, why):
+        if dst not in edges[src]:
+            edges[src].add(dst)
+            reasons.append((src, dst, why))
+
+    for s in enabled:
+        name = s["stage"]
+        defn = _STAGE_REGISTRY[name]
+        for key in defn.requires:
+            p = provider_for(key, name)
+            if p is None:
+                raise PipelineConfigError(
+                    f"stage {name!r} requires {key!r}, but no enabled stage "
+                    "provides it (its provider stage is missing or disabled)"
+                )
+            add_edge(p, name, f"provides {key!r}")
+        for key in defn.optional_requires:
+            p = provider_for(key, name)
+            if p is not None:
+                add_edge(p, name, f"provides {key!r} (optional)")
+        for dep in s["after"]:
+            if dep not in pos:
+                raise PipelineConfigError(
+                    f"stage {name!r} has 'after': {dep!r}, which is not an "
+                    "enabled stage in this config"
+                )
+            add_edge(dep, name, "after")
+        for dep in s["before"]:
+            if dep not in pos:
+                raise PipelineConfigError(
+                    f"stage {name!r} has 'before': {dep!r}, which is not an "
+                    "enabled stage in this config"
+                )
+            add_edge(name, dep, "before")
+
+    order = _topo_sort([s["stage"] for s in enabled], edges, pos)
+    if order is None:
+        cycle = _find_cycle([s["stage"] for s in enabled], edges)
+        raise PipelineConfigError(
+            "cyclic pipeline dependency: " + " -> ".join(cycle)
+        )
+
+    by_name = {s["stage"]: s for s in enabled}
+    resolved = [_ResolvedStage(n, by_name[n]["params"]) for n in order]
+    groups = {"main": [], "candidate": [], "merge": []}
+    for r in resolved:
+        groups[_STAGE_REGISTRY[r.name].group].append(r)
+    return {"stages": resolved, "groups": groups, "edges": reasons}
+
+
+def _run_candidate(ctx, n_pal: int) -> GBImage:
+    """Run the candidate-group stages for ``n_pal`` master palettes.
+
+    Memoized per conversion run: the conform stage's tile loop only tightens
+    the merge target, so it re-merges the cached pre-merge candidate instead
+    of repacking.
+    """
+    cached = ctx.candidate_cache.get(n_pal)
+    if cached is not None:
+        return cached
+    ctx.n_pal = n_pal
+    for stage in ctx.plan["candidate"]:
+        _STAGE_REGISTRY[stage.name].func(ctx, stage.params)
+    ctx.candidate_cache[n_pal] = ctx.gb
+    return ctx.gb
+
+
+def _run_merge(ctx, gb: GBImage, target) -> tuple:
+    """Run the merge-group stages on a candidate GBImage -> (gb, n_merges)."""
+    ctx.gb = gb
+    ctx.merge_target = target
+    ctx.n_merges = 0
+    for stage in ctx.plan["merge"]:
+        _STAGE_REGISTRY[stage.name].func(ctx, stage.params)
+    return ctx.gb, ctx.n_merges
+
+
+def describe_pipeline(config=None) -> dict:
+    """Resolve ``config`` (default: DEFAULT_PIPELINE_CONFIG) and describe the
+    resulting stage call graph without running anything.
+
+    Returns ``{"stages": [...], "edges": [...]}`` with stages in execution
+    order (each ``{"name", "group", "requires", "provides", "params"}``) and
+    edges as ``(from_stage, to_stage, reason)`` triples. Raises
+    PipelineConfigError for a malformed config, exactly as
+    convert_with_pipeline would.
+    """
+    plan = _resolve_pipeline(config)
+    stages = [
+        {
+            "name": r.name,
+            "group": _STAGE_REGISTRY[r.name].group,
+            "requires": list(_STAGE_REGISTRY[r.name].requires),
+            "provides": list(_STAGE_REGISTRY[r.name].provides),
+            "params": r.params,
+        }
+        for r in plan["stages"]
+    ]
+    return {"stages": stages, "edges": list(plan["edges"])}
+
+
+def convert_with_pipeline(
+    image: Image.Image,
+    preset: str,
+    config=None,
+    *,
+    tile_budget: int | None = None,
+    reserve_ui_palette: bool = True,
+    dither: str = "none",
+    custom_palette: np.ndarray | None = None,
+    mono_ramp: np.ndarray | None = None,
+    max_colors: int | None = None,
+) -> ConversionResult:
+    """Convert ``image`` with an explicit, composable pipeline config.
+
+    ``config`` is a mapping ``{"stages": [...]}`` (or a bare list) where each
+    entry is a stage name or a mapping::
+
+        {"stage": "dither",            # one of the registered stage names
+         "enabled": True,              # false drops the stage from the run
+         "params": {"mode": "bayer"},  # per-stage parameters
+         "after": ["quantize"],        # explicit ordering constraints
+         "before": ["export"]}
+
+    Stage order comes from each stage's declared requires/provides edges plus
+    any after/before constraints (topologically sorted; the config list order
+    breaks ties). Registered stages: prepare, quantize, palette_map, dither,
+    dedup, merge_budget, conform, export. Per-stage parameters: ``dither``
+    takes ``mode`` ("none"/"bayer", overriding the ``dither`` argument);
+    ``conform`` takes ``oracle`` (false skips the GB Studio importer loop).
+    ``None`` means DEFAULT_PIPELINE_CONFIG, which is bit-identical to
+    ``convert_for_hardware``. Raises PipelineConfigError for unknown stages,
+    unmet requirements, or dependency cycles. All other keyword arguments are
+    exactly those of ``convert_for_hardware``.
+    """
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset: {preset!r}")
+    plan = _resolve_pipeline(config)
+    ctx = _PipelineCtx()
+    ctx.image = image
+    ctx.ps = PRESETS[preset]
+    ctx.tile_budget = tile_budget
+    ctx.reserve_ui_palette = reserve_ui_palette
+    ctx.dither = dither
+    ctx.custom_palette = custom_palette
+    ctx.mono_ramp = mono_ramp
+    ctx.max_colors = max_colors
+    ctx.warnings = []
+    ctx.candidate_cache = {}
+    ctx.plan = plan["groups"]
+    for stage in ctx.plan["main"]:
+        _STAGE_REGISTRY[stage.name].func(ctx, stage.params)
+    return ctx.result
+
+
+def convert_for_hardware(
+    image: Image.Image,
+    preset: str,
+    *,
+    tile_budget: int | None = None,
+    reserve_ui_palette: bool = True,
+    dither: str = "none",
+    custom_palette: np.ndarray | None = None,
+    mono_ramp: np.ndarray | None = None,
+    max_colors: int | None = None,
+) -> ConversionResult:
+    """Convert ``image`` to a GB Studio-importable render for a named preset.
+
+    ``preset`` is a key of ``PRESETS``. Runs the default pipeline config (see
+    DEFAULT_PIPELINE_CONFIG): RGB-convert, crop to multiples of 8 (logo
+    presets are resized to their fixed size), quantize to a bounded working
+    set, pack palettes, index tiles (mono uses the ramp path), losslessly
+    dedup (skipped for logo), lossily merge to the tile budget (skipped for
+    logo / no budget), then verify and render. ``reserve_ui_palette``
+    reserves palette 8 for the dialogue/UI palette by reducing an 8-palette
+    color preset to 7. ``max_colors`` (color presets only; ignored for mono)
+    is a target for the total distinct colors across all palettes: it is
+    clamped to the hardware ceiling (32, or 28 with the UI palette reserved
+    -- with a warning), the palette count becomes ``ceil(max_colors / 4)``,
+    and a budget that is not a whole number of palettes is enforced by
+    folding the surplus colors together. ``None`` means "use everything the
+    hardware allows". Returns a ConversionResult with the final and pre-merge
+    reference images, verified stats, warnings, and per-palette hex swatches.
+    """
+    return convert_with_pipeline(
+        image,
+        preset,
+        None,
+        tile_budget=tile_budget,
+        reserve_ui_palette=reserve_ui_palette,
+        dither=dither,
+        custom_palette=custom_palette,
+        mono_ramp=mono_ramp,
+        max_colors=max_colors,
     )

@@ -1,0 +1,65 @@
+{
+  "dither": "bayer",
+  "image": "flat",
+  "palette_hex": [
+    [
+      "#F7E6CE",
+      "#F7E6CE",
+      "#F7E6CE",
+      "#313AA5"
+    ],
+    [
+      "#3A8C5A",
+      "#3A8C5A",
+      "#3A8C5A",
+      "#3A8C5A"
+    ],
+    [
+      "#F7E6CE",
+      "#F7E6CE",
+      "#3A8C5A",
+      "#B5313A"
+    ],
+    [
+      "#3A8C5A",
+      "#B5313A",
+      "#B5313A",
+      "#B5313A"
+    ],
+    [
+      "#F7E6CE",
+      "#F7E6CE",
+      "#F7E6CE",
+      "#B5313A"
+    ],
+    [
+      "#B5313A",
+      "#B5313A",
+      "#B5313A",
+      "#B5313A"
+    ],
+    [
+      "#F7E6CE",
+      "#F7E6CE",
+      "#F7E6CE",
+      "#3A8C5A"
+    ]
+  ],
+  "preset": "color_only",
+  "stats": {
+    "colors_target": 28,
+    "colors_used": 4,
+    "dither": "bayer",
+    "gbstudio_corrupted_tiles": 0,
+    "gbstudio_palettes_extracted": 1,
+    "gbstudio_recolored_tiles": 0,
+    "gbstudio_tiles": 14,
+    "n_merges": 0,
+    "p95_delta_e": 0.0,
+    "palettes_used": 7,
+    "preset": "color_only",
+    "tile_budget": 384,
+    "tiles_used": 14
+  },
+  "warnings": []
+}

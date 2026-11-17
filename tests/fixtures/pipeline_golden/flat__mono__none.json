@@ -1,0 +1,25 @@
+{
+  "dither": "none",
+  "image": "flat",
+  "palette_hex": [
+    [
+      "#E6FFD6",
+      "#8CC573",
+      "#316B52",
+      "#081921"
+    ]
+  ],
+  "preset": "mono",
+  "stats": {
+    "colors_target": null,
+    "colors_used": 4,
+    "dither": "none",
+    "n_merges": 0,
+    "p95_delta_e": 0.0,
+    "palettes_used": 1,
+    "preset": "mono",
+    "tile_budget": 192,
+    "tiles_used": 15
+  },
+  "warnings": []
+}

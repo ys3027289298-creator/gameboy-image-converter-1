@@ -1,0 +1,65 @@
+{
+  "dither": "none",
+  "image": "grad",
+  "palette_hex": [
+    [
+      "#295ACE",
+      "#2152CE",
+      "#214AC5",
+      "#2142CE"
+    ],
+    [
+      "#CE4A21",
+      "#C53A4A",
+      "#D63121",
+      "#C53121"
+    ],
+    [
+      "#6B947B",
+      "#84637B",
+      "#AD4A84",
+      "#844263"
+    ],
+    [
+      "#E6EFE6",
+      "#B5EFD6",
+      "#84F7B5",
+      "#F7A5D6"
+    ],
+    [
+      "#BD6B9C",
+      "#DE5AA5",
+      "#E62994",
+      "#B5196B"
+    ],
+    [
+      "#086B31",
+      "#73104A",
+      "#102919",
+      "#190819"
+    ],
+    [
+      "#31F784",
+      "#63CE8C",
+      "#29C56B",
+      "#3A9463"
+    ]
+  ],
+  "preset": "color_only",
+  "stats": {
+    "colors_target": 28,
+    "colors_used": 28,
+    "dither": "none",
+    "gbstudio_corrupted_tiles": 0,
+    "gbstudio_palettes_extracted": 8,
+    "gbstudio_recolored_tiles": 6,
+    "gbstudio_tiles": 41,
+    "n_merges": 0,
+    "p95_delta_e": 0.0,
+    "palettes_used": 7,
+    "preset": "color_only",
+    "tile_budget": 384,
+    "tiles_used": 41
+  },
+  "warnings": []
+}
