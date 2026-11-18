@@ -1880,3 +1880,481 @@ def convert_for_hardware(
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 9 -- map layer split / priority composite / transparency occlusion
+# ---------------------------------------------------------------------------
+#
+# The converter above renders every element of a map into ONE flat index map,
+# so the background and the sprites can no longer be adjusted separately. This
+# section adds three independently switchable stages over uint8 index maps
+# (the same 0..N-1 space a GB tile's patterns use -- index 0 is the classic DMG
+# transparent slot):
+#
+#   1. split_map_layers      -- route each pixel into one of ``n_layers``
+#                               planes (background + sprite planes);
+#   2. composite_layers      -- paint the planes back in a configurable
+#                               draw priority, honouring a transparent index
+#                               (occlusion can be switched off on its own);
+#   3. split_composite_layers -- the fused single-pass entry: one raster walk
+#                               of the input performs 1+2 (and can run with any
+#                               of the three stages bypassed).
+#
+# Memory discipline: the fused kernel never materialises any full-image
+# scratch beyond the output plane buffers themselves, and touches each input
+# cell exactly once -- ``pixels_visited`` in the returned stats equals
+# H*W by construction and is asserted on by the test suite. With every stage
+# enabled the composite output is pixel-identical to the flat input.
+
+
+@dataclass
+class LayerSplitResult:
+    """Output of :func:`split_map_layers`."""
+
+    layers: np.ndarray          # (n_layers, H, W) uint8; unused cells == transparent_index
+    transparent_index: int      # the index treated as "no opaque pixel"
+    transparent_per_layer: list # int per layer: transparent cells in that plane
+    pixels_visited: int         # input cells read (== H * W: single pass)
+
+
+@dataclass
+class LayerCompositeResult:
+    """Output of :func:`composite_layers`."""
+
+    image: np.ndarray           # (H, W) uint8 composite
+    transparent_index: int
+    transparent_pixels: int     # cells no layer painted opaquely
+    pixels_visited: int         # output cells written (== H * W: single pass)
+
+
+@dataclass
+class LayerPipelineResult:
+    """Output of :func:`split_composite_layers` -- split + composite stats."""
+
+    layers: np.ndarray          # (n_layers, H, W) uint8
+    image: np.ndarray           # (H, W) uint8 composite
+    transparent_index: int
+    transparent_per_layer: list
+    transparent_pixels: int     # transparent cells in the final composite
+    diff_pixels: int            # composite vs. the flat input
+    pixels_visited: int         # input cells read in the single fused pass
+    stats: dict
+
+
+def _is_int(value) -> bool:
+    """True for Python ints and numpy integer scalars, but never bool/float."""
+    return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+
+
+def _validate_transparent_index(transparent_index) -> int:
+    """Type/range check for the transparent slot: it must be a uint8 index."""
+    if not _is_int(transparent_index):
+        raise ValueError(
+            f"transparent_index must be an int in 0..255, got "
+            f"{type(transparent_index).__name__}"
+        )
+    transparent_index = int(transparent_index)
+    if not 0 <= transparent_index <= 255:
+        raise ValueError(
+            f"transparent_index {transparent_index} is out of bounds for an "
+            "8-bit index map (allowed range 0..255)"
+        )
+    return transparent_index
+
+
+def _validate_layer_count(n_layers) -> int:
+    """Type/range check for the configurable plane count."""
+    if not _is_int(n_layers):
+        raise ValueError(
+            f"n_layers must be an int in 1..256, got {type(n_layers).__name__}"
+        )
+    n_layers = int(n_layers)
+    if not 1 <= n_layers <= 256:
+        raise ValueError(f"n_layers must be in 1..256, got {n_layers}")
+    return n_layers
+
+
+def _validate_index_value(value, name: str) -> int:
+    """Type/range check for any 8-bit index value (fill, transparent slot)."""
+    if not _is_int(value):
+        raise ValueError(
+            f"{name} must be an int in 0..255, got {type(value).__name__}"
+        )
+    value = int(value)
+    if not 0 <= value <= 255:
+        raise ValueError(
+            f"{name} {value} is out of bounds for an 8-bit index map "
+            "(allowed range 0..255)"
+        )
+    return value
+
+
+def _validate_priority(priority, n_layers: int) -> list:
+    """Validate the draw order and return it as a list of layer ids.
+
+    ``priority`` lists layer ids from BOTTOM (painted first) to TOP (painted
+    last). It must contain every layer id exactly once.
+    """
+    if priority is None:
+        return list(range(n_layers))
+    if not isinstance(priority, (list, tuple)):
+        raise ValueError("priority must be a list/tuple of layer ids or None")
+    if len(priority) != n_layers:
+        raise ValueError(
+            f"priority has {len(priority)} entries but n_layers={n_layers}; "
+            "every layer must appear exactly once"
+        )
+    seen = set()
+    for layer_id in priority:
+        if not _is_int(layer_id):
+            raise ValueError(
+                f"priority entries must be int layer ids, got {layer_id!r}"
+            )
+        layer_id = int(layer_id)
+        if not 0 <= layer_id < n_layers:
+            raise ValueError(
+                f"priority entry {layer_id} is out of bounds for {n_layers} "
+                f"layers (allowed layer ids 0..{n_layers - 1})"
+            )
+        if layer_id in seen:
+            raise ValueError(f"priority lists layer {layer_id} more than once")
+        seen.add(layer_id)
+    return list(priority)
+
+
+def split_map_layers(
+    index_map: np.ndarray,
+    layer_ids: np.ndarray,
+    *,
+    n_layers: int = 2,
+    transparent_index: int = 0,
+    background_fill: int = 0,
+) -> LayerSplitResult:
+    """Split a flat uint8 index map into ``n_layers`` independent planes.
+
+    ``index_map`` is (H, W) uint8; ``layer_ids`` is the same shape and gives,
+    per pixel, the plane (0..n_layers-1) that pixel belongs to. Layer 0 is the
+    background: it receives the configurable ``background_fill`` index wherever
+    a foreground (sprite) pixel sits, so its plane stays a complete, separately
+    editable backdrop. Every other plane starts fully transparent
+    (``transparent_index``) and receives only its own pixels.
+
+    Single raster pass: each input cell is read once and written to exactly one
+    plane (the background fill is produced during the same walk, not by a
+    separate fill step), so ``pixels_visited`` is H*W.
+    """
+    t = _validate_transparent_index(transparent_index)
+    n_layers = _validate_layer_count(n_layers)
+    background_fill = _validate_index_value(background_fill, "background_fill")
+
+    idx = np.asarray(index_map)
+    if idx.ndim != 2 or idx.dtype != np.uint8:
+        raise ValueError("index_map must be a 2-D uint8 array")
+    h, w = idx.shape
+
+    lid = np.asarray(layer_ids)
+    if lid.shape != idx.shape:
+        raise ValueError(
+            f"layer_ids shape {lid.shape} does not match index_map shape {idx.shape}"
+        )
+
+    layers = np.full((n_layers, h, w), t, dtype=np.uint8)
+    transparent_per_layer = [h * w] * n_layers
+    visited = 0
+
+    flat_idx = idx.reshape(-1)
+    flat_lid = lid.reshape(-1)
+    flat_layers = layers.reshape(n_layers, -1)
+    for k in range(h * w):
+        owner = int(flat_lid[k])
+        if not 0 <= owner < n_layers:
+            raise ValueError(
+                f"layer id {owner} at pixel {divmod(k, w)} is out of bounds "
+                f"for n_layers={n_layers} (allowed 0..{n_layers - 1})"
+            )
+        value = int(flat_idx[k])
+        # The background plane gets every cell; foreground planes get only
+        # their own. A transparent source pixel never counts as opaque fill.
+        if owner == 0:
+            flat_layers[0, k] = value
+            if value != t:
+                transparent_per_layer[0] -= 1
+        else:
+            flat_layers[0, k] = background_fill
+            flat_layers[owner, k] = value
+            if background_fill != t:
+                transparent_per_layer[0] -= 1
+            if value != t:
+                transparent_per_layer[owner] -= 1
+        visited += 1
+
+    return LayerSplitResult(
+        layers=layers,
+        transparent_index=t,
+        transparent_per_layer=transparent_per_layer,
+        pixels_visited=visited,
+    )
+
+
+def composite_layers(
+    layers: np.ndarray,
+    *,
+    transparent_index: int = 0,
+    priority: list | None = None,
+    occlusion: bool = True,
+) -> LayerCompositeResult:
+    """Composite stacked planes into one flat index map.
+
+    ``layers`` is (n_layers, H, W) uint8. Planes paint in ``priority`` order
+    (bottom-first; defaults to layer 0 at the back). With ``occlusion=True`` a
+    plane's transparent cell lets whatever is already underneath show through
+    (the classic hardware behaviour -- sprites only cover what they opaquely
+    draw). With ``occlusion=False`` the transparent index is treated as an
+    ordinary paint value, so a higher-priority plane's transparent cell
+    overwrites lower planes too. Cells no plane paints opaquely remain at
+    ``transparent_index`` in the output.
+
+    Single raster pass: each output cell is computed and written once while the
+    planes are walked in priority order, so ``pixels_visited`` is H*W.
+    """
+    t = _validate_transparent_index(transparent_index)
+    planes = np.asarray(layers)
+    if planes.ndim != 3 or planes.dtype != np.uint8:
+        raise ValueError("layers must be a 3-D (n_layers, H, W) uint8 array")
+    n_layers, h, w = planes.shape
+    order = _validate_priority(priority, n_layers)
+    if not isinstance(occlusion, bool):
+        raise ValueError("occlusion must be bool")
+
+    out = np.full((h, w), t, dtype=np.uint8)
+    flat_out = out.reshape(-1)
+    flat_planes = planes.reshape(n_layers, -1)
+    transparent_pixels = 0
+    visited = 0
+
+    for k in range(h * w):
+        winner = t
+        winner_is_transparent = True
+        for lid in order:
+            value = int(flat_planes[lid, k])
+            if occlusion:
+                # Opaque paint always covers; transparent paint is a no-op so
+                # the lower plane stays visible.
+                if value != t:
+                    winner = value
+                    winner_is_transparent = False
+            else:
+                # Occlusion off: the topmost plane in priority wins outright,
+                # transparent index included.
+                winner = value
+                winner_is_transparent = value == t
+        flat_out[k] = winner
+        if winner_is_transparent:
+            transparent_pixels += 1
+        visited += 1
+
+    return LayerCompositeResult(
+        image=out,
+        transparent_index=t,
+        transparent_pixels=transparent_pixels,
+        pixels_visited=visited,
+    )
+
+
+def split_composite_layers(
+    index_map: np.ndarray,
+    layer_ids: np.ndarray,
+    *,
+    n_layers: int = 2,
+    transparent_index: int = 0,
+    priority: list | None = None,
+    enable_split: bool = True,
+    enable_composite: bool = True,
+    enable_occlusion: bool = True,
+    background_fill: int = 0,
+) -> LayerPipelineResult:
+    """Fused split + composite over a flat index map, in ONE raster traversal.
+
+    The three stages are independently switchable:
+
+    * ``enable_split=False`` -- every pixel is routed to layer 0; the other
+      planes stay fully transparent (the split stage is bypassed).
+    * ``enable_composite=False`` -- the composite stage is bypassed: the flat
+      input passes through byte-for-byte (the planes are still produced when
+      splitting is enabled, so they remain independently editable).
+    * ``enable_occlusion=False`` -- within an enabled composite, transparent
+      cells paint like ordinary indices instead of revealing lower planes.
+
+    ``priority`` lists layer ids bottom-first (defaults to 0..n_layers-1).
+    ``background_fill`` is the index stamped into the background plane beneath
+    foreground pixels; it must be a valid uint8 index. A
+    :class:`ValueError` is raised for any out-of-bounds transparent index,
+    layer count, priority entry, layer id, or background fill.
+
+    Memory: besides the ``n_layers`` output planes and the single composite
+    buffer, no full-image scratch is allocated; the input is read once
+    (``pixels_visited == H*W``). With every stage on its default settings the
+    composite equals the input exactly (``diff_pixels == 0``).
+    """
+    t = _validate_transparent_index(transparent_index)
+    n_layers = _validate_layer_count(n_layers)
+    order = _validate_priority(priority, n_layers)
+    for flag_name, flag in (
+        ("enable_split", enable_split),
+        ("enable_composite", enable_composite),
+        ("enable_occlusion", enable_occlusion),
+    ):
+        if not isinstance(flag, bool):
+            raise ValueError(f"{flag_name} must be bool")
+    background_fill = _validate_index_value(background_fill, "background_fill")
+
+    idx = np.asarray(index_map)
+    if idx.ndim != 2 or idx.dtype != np.uint8:
+        raise ValueError("index_map must be a 2-D uint8 array")
+    h, w = idx.shape
+
+    lid = np.asarray(layer_ids)
+    if lid.shape != idx.shape:
+        raise ValueError(
+            f"layer_ids shape {lid.shape} does not match index_map shape {idx.shape}"
+        )
+
+    # Rank of each layer in the draw order -- higher rank paints later/on top.
+    rank = [0] * n_layers
+    for r, layer_id in enumerate(order):
+        rank[layer_id] = r
+
+    layers = np.full((n_layers, h, w), t, dtype=np.uint8)
+    out = np.full((h, w), t, dtype=np.uint8)
+    transparent_per_layer = [h * w] * n_layers
+
+    flat_idx = idx.reshape(-1)
+    flat_lid = lid.reshape(-1)
+    flat_layers = layers.reshape(n_layers, -1)
+    flat_out = out.reshape(-1)
+
+    visited = 0
+    transparent_pixels = 0
+    diff_pixels = 0
+    n_cells = h * w
+
+    # Local bindings keep the hot loop free of attribute lookups.
+    _t = t
+    _n = n_layers
+    _split = enable_split
+    _composite = enable_composite
+    _occlusion = enable_occlusion
+    _rank = rank
+    _bg = background_fill
+
+    # At a cell owned by foreground plane ``o`` every plane other than o and 0
+    # still holds its initial transparent value. Precompute the highest rank
+    # among those "rest" planes per owner, and the highest rank outside plane 0,
+    # so the winner is decided in O(1) per cell without scanning the planes.
+    rest_max_rank = [max(rank[1:o] + rank[o + 1:]) if _n > 2 else -1
+                     for o in range(1, _n)]
+    nonbg_max_rank = max(rank[1:])  # highest-ranking non-background plane
+    bg_rank = rank[0]
+
+    for k in range(n_cells):
+        value = int(flat_idx[k])
+        if _split:
+            owner = int(flat_lid[k])
+            if not 0 <= owner < _n:
+                raise ValueError(
+                    f"layer id {owner} at pixel {divmod(k, w)} is out of "
+                    f"bounds for n_layers={_n} (allowed 0..{_n - 1})"
+                )
+        else:
+            owner = 0
+
+        # Stage 1 -- split. The background plane is filled during this same
+        # walk (never a separate pass); foreground planes take their own pixel.
+        if owner == 0:
+            flat_layers[0, k] = value
+            if value != _t:
+                transparent_per_layer[0] -= 1
+        else:
+            flat_layers[0, k] = _bg
+            if _bg != _t:
+                transparent_per_layer[0] -= 1
+            flat_layers[owner, k] = value
+            if value != _t:
+                transparent_per_layer[owner] -= 1
+
+        # Stages 2+3 -- priority composite with transparent-index occlusion.
+        if not _composite:
+            # Composite bypassed: the flat map passes through unchanged.
+            winner = value
+        elif not _split:
+            # No planes: the single flat value is the only candidate.
+            winner = value
+        elif owner == 0:
+            # Background-owned cell: other planes still hold transparent t.
+            if _occlusion:
+                # An opaque background wins; a transparent bg stays transparent
+                # (every other plane is transparent at this cell).
+                winner = value
+            else:
+                # Occlusion off: the topmost non-bg plane paints its t if it
+                # outranks the background, otherwise the background value.
+                winner = _t if nonbg_max_rank > bg_rank else value
+        else:
+            owner_rank = _rank[owner]
+            if _occlusion:
+                # Opaque candidates are the owner (if value != t) and the bg
+                # fill (if it is not itself the transparent index). The
+                # highest-ranking opaque candidate wins; a transparent bg fill
+                # never suppresses an opaque sprite.
+                winner = _t
+                if _bg != _t:
+                    winner = _bg
+                if value != _t and (winner == _t or owner_rank > bg_rank):
+                    winner = value
+            else:
+                # Occlusion off: the transparent index paints like an ordinary
+                # value, so the three candidate groups (owner, bg, rest) all
+                # weigh in, winner = highest rank.
+                r_rank = rest_max_rank[owner - 1]
+                candidates = ((owner_rank, value), (bg_rank, _bg), (r_rank, _t))
+                winner = max(candidates, key=lambda pair: pair[0])[1]
+
+        flat_out[k] = winner
+        if _composite:
+            if winner == _t:
+                transparent_pixels += 1
+            if winner != value:
+                diff_pixels += 1
+        visited += 1
+
+    if not enable_composite:
+        # Passthrough output: count transparency against the flat input.
+        transparent_pixels = int(np.count_nonzero(idx == t))
+        diff_pixels = 0
+        visited = n_cells
+
+    stats = {
+        "n_layers": n_layers,
+        "transparent_index": t,
+        "priority": list(order),
+        "enable_split": bool(enable_split),
+        "enable_composite": bool(enable_composite),
+        "enable_occlusion": bool(enable_occlusion),
+        "pixels_visited": visited,
+        "pixels_total": n_cells,
+        "transparent_pixels": transparent_pixels,
+        "transparent_per_layer": list(transparent_per_layer),
+        "diff_pixels": diff_pixels,
+    }
+
+    return LayerPipelineResult(
+        layers=layers,
+        image=out,
+        transparent_index=t,
+        transparent_per_layer=list(transparent_per_layer),
+        transparent_pixels=transparent_pixels,
+        diff_pixels=diff_pixels,
+        pixels_visited=visited,
+        stats=stats,
+    )
