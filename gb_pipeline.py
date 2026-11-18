@@ -9,6 +9,7 @@ breakdown these functions implement.
 
 import heapq
 import threading
+import time
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -1879,4 +1880,419 @@ def convert_for_hardware(
         stats=stats,
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
+    )
+
+
+# --- OAM per-scanline sprite budget -----------------------------------------
+#
+# DMG/GBC hardware draws at most 10 sprites per scanline: the 11th sprite a
+# line intersects is simply not drawn that line, and with no arbitration the
+# line flickers as OAM contents change. This section models that limit as a
+# static, priority-driven allocation: every frame, each line keeps only the
+# ``max_per_scanline`` highest-scoring sprites it intersects, and every sprite
+# that loses a line is *demoted* -- the lost scanline strips are baked into the
+# background (the classic "sprite -> background tile" fallback), so nothing
+# blinks. Priority score combines, with configurable weights:
+#   * distance  -- closer to the player ranks higher (score = 1 - d/dmax)
+#   * frequency -- sprites seen in more frames rank higher (f / fmax)
+#   * area      -- larger sprites rank higher (area / amax)
+# All components are normalized to [0, 1] per sequence before weighting, so the
+# weights are pure knobs with no resolution dependency. Ties break on sprite
+# id then object order, making every allocation fully deterministic.
+
+@dataclass
+class SpriteObject:
+    """One sprite instance in a frame, positioned at integer pixel (x, y).
+
+    ``pixels`` is an (h, w, 3) uint8 RGB array; ``transparent`` is an (h, w)
+    bool array, True where the sprite is transparent (drawn nowhere). ``id`` is
+    the sprite's stable identity across frames (used for frequency); two
+    sprites may share an id.
+    """
+
+    x: int
+    y: int
+    pixels: np.ndarray
+    transparent: np.ndarray
+    id: int
+
+    def __post_init__(self):
+        self.x = int(self.x)
+        self.y = int(self.y)
+        self.id = int(self.id)
+        self.pixels = np.asarray(self.pixels, dtype=np.uint8)
+        self.transparent = np.asarray(self.transparent, dtype=bool)
+        if self.pixels.ndim != 3 or self.pixels.shape[2] != 3:
+            raise ValueError("sprite pixels must be an (h, w, 3) RGB array")
+        if self.transparent.shape != self.pixels.shape[:2]:
+            raise ValueError("transparent mask shape must match pixels (h, w)")
+        if self.pixels.shape[0] == 0 or self.pixels.shape[1] == 0:
+            raise ValueError("sprite pixels must be non-empty")
+
+
+@dataclass
+class SpriteFrame:
+    """One frame of a sequence: the sprites in OAM and that frame's background.
+
+    ``background`` is an (H, W, 3) uint8 RGB array, shared-size across the
+    whole sequence (per-frame backgrounds are allowed).
+    """
+
+    sprites: list
+    background: np.ndarray
+
+    def __post_init__(self):
+        self.background = np.asarray(self.background, dtype=np.uint8)
+        if self.background.ndim != 3 or self.background.shape[2] != 3:
+            raise ValueError("background must be an (H, W, 3) RGB array")
+        for sp in self.sprites:
+            if not isinstance(sp, SpriteObject):
+                raise ValueError("frame sprites must be SpriteObject instances")
+
+
+@dataclass(frozen=True)
+class ScanlineBudget:
+    """Configurable per-scanline sprite limit and priority weights.
+
+    ``max_per_scanline`` must be a positive int (the hardware value is 10;
+    non-ints, bools, zero and negative values raise ValueError). Weights must
+    be non-negative finite numbers, at least one strictly positive.
+
+    ``background_palette`` is the (k, 3) uint8 RGB palette the background layer
+    is restricted to. A demoted sprite strip is baked into the background
+    *through this palette* (nearest-entry snap), which is exactly where
+    demotion costs image quality on real hardware: sprites may use their own
+    per-sprite palettes, background tiles may not. Defaults to the DMG ramp.
+    """
+
+    max_per_scanline: int = 10
+    weight_distance: float = 1.0
+    weight_frequency: float = 1.0
+    weight_area: float = 1.0
+    background_palette: np.ndarray = None
+
+    def __post_init__(self):
+        limit = self.max_per_scanline
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError(
+                f"max_per_scanline must be a positive int, got {limit!r}"
+            )
+        weights = (
+            ("weight_distance", self.weight_distance),
+            ("weight_frequency", self.weight_frequency),
+            ("weight_area", self.weight_area),
+        )
+        for name, value in weights:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number, got {value!r}")
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value!r}")
+        if all(float(v) == 0.0 for _, v in weights):
+            raise ValueError(
+                "at least one priority weight must be strictly positive"
+            )
+        palette = self.background_palette
+        if palette is None:
+            palette = DMG_RAMP
+        palette = np.asarray(palette, dtype=np.uint8)
+        if palette.ndim != 2 or palette.shape[1] != 3 or palette.shape[0] == 0:
+            raise ValueError(
+                "background_palette must be a non-empty (k, 3) uint8 RGB array"
+            )
+        object.__setattr__(self, "background_palette", palette)
+
+
+@dataclass
+class FrameSpriteAllocation:
+    """Per-frame allocation record for one sprite."""
+
+    sprite_id: int
+    object_index: int
+    score: float
+    kept: bool
+    lost_lines: list          # sprite-local rows this sprite was bumped from
+    baked: bool                # any lost strip was baked into the background
+
+
+@dataclass
+class SpriteBudgetResult:
+    """Outcome of allocating a frame sequence under a ScanlineBudget."""
+
+    unrestricted: list         # list[np.ndarray] RGB composites, no limit
+    restricted: list           # list[np.ndarray] RGB composites, limited
+    backgrounds: list          # list[np.ndarray] backgrounds with demoted strips
+    allocations: list          # list[list[FrameSpriteAllocation]], per frame
+    stats: dict
+
+
+def _snap_to_palette(rgb: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    """Nearest-entry RGB snap of (n, 3) pixels onto an (k, 3) palette.
+
+    Plain squared-distance mapping (no third-party dependency); uint8 in and
+    out. Used to model the quality loss when a sprite strip is demoted onto
+    background tiles, which may only express background-palette colors.
+    """
+    rgb = np.asarray(rgb, dtype=np.float64)
+    pal = np.asarray(palette, dtype=np.float64)
+    # (n, 1, 3) - (1, k, 3) -> (n, k) squared distances.
+    dist = ((rgb[:, None, :] - pal[None, :, :]) ** 2).sum(axis=2)
+    nearest = np.argmin(dist, axis=1)
+    return np.asarray(palette, dtype=np.uint8)[nearest]
+
+
+def _blit_sprite(canvas: np.ndarray, sp: SpriteObject,
+                 row_mask: np.ndarray | None,
+                 palette: np.ndarray | None = None) -> int:
+    """Blit one sprite's opaque pixels onto ``canvas`` (in place).
+
+    When ``row_mask`` is given (bool over the sprite's own rows), only those
+    sprite rows are drawn; otherwise every opaque pixel is drawn. When
+    ``palette`` is given, painted pixels are first snapped to its nearest
+    entries (background-tile demotion); otherwise the sprite's own RGB values
+    are drawn (OAM path). Returns the number of canvas pixels actually painted.
+    The source/destination slice assignment uses copied views so no array
+    aliases escape.
+    """
+    h, w = sp.pixels.shape[:2]
+    H, W = canvas.shape[:2]
+    x0, y0 = sp.x, sp.y
+    sx0 = max(0, -x0)
+    sy0 = max(0, -y0)
+    sx1 = min(w, W - x0)
+    sy1 = min(h, H - y0)
+    if sx0 >= sx1 or sy0 >= sy1:
+        return 0
+    dx0, dy0 = x0 + sx0, y0 + sy0
+    dx1, dy1 = x0 + sx1, y0 + sy1
+    opaque = ~sp.transparent[sy0:sy1, sx0:sx1]
+    if row_mask is not None:
+        opaque = opaque & row_mask[sy0:sy1, None]
+    if not opaque.any():
+        return 0
+    src = sp.pixels[sy0:sy1, sx0:sx1][opaque]
+    if palette is not None:
+        src = _snap_to_palette(src, palette)
+    dst = canvas[dy0:dy1, dx0:dx1]
+    dst[opaque] = src
+    return int(opaque.sum())
+
+
+def _composite_unrestricted(frame: SpriteFrame) -> np.ndarray:
+    """Background with every sprite drawn in deterministic object order."""
+    out = np.array(frame.background, copy=True)
+    for sp in frame.sprites:
+        _blit_sprite(out, sp, None)
+    return out
+
+
+def allocate_sprite_budget(frames: list, player_xy: tuple,
+                           budget: ScanlineBudget) -> SpriteBudgetResult:
+    """Allocate each frame's sprites under the per-scanline limit.
+
+    Returns the unrestricted composites (the no-limit reference), the limited
+    composites (demoted strips baked into the background), the baked
+    backgrounds, per-frame allocation records and aggregate stats. With no
+    over-limit line the limited composites are pixel-identical to the
+    unrestricted ones by construction.
+    """
+    if not isinstance(budget, ScanlineBudget):
+        raise ValueError("budget must be a ScanlineBudget instance")
+    if not frames:
+        raise ValueError("frames must be a non-empty list of SpriteFrame")
+    for fr in frames:
+        if not isinstance(fr, SpriteFrame):
+            raise ValueError("frames must contain SpriteFrame instances")
+    px, py = float(player_xy[0]), float(player_xy[1])
+
+    H, W = frames[0].background.shape[:2]
+    for fi, fr in enumerate(frames):
+        if fr.background.shape[:2] != (H, W):
+            raise ValueError(
+                f"frame {fi} background size {fr.background.shape[:2]} "
+                f"does not match sequence size {(H, W)}"
+            )
+
+    n_frames = len(frames)
+
+    # Frequency: in how many frames each sprite id appears (global across the
+    # sequence, so a sprite that blinks in rarely loses priority).
+    seen_per_id: dict = {}
+    for fr in frames:
+        for sid in {sp.id for sp in fr.sprites}:
+            seen_per_id[sid] = seen_per_id.get(sid, 0) + 1
+    fmax = max(seen_per_id.values()) if seen_per_id else 1
+
+    # Normalization constants for the three score components.
+    dmax = 0.0
+    amax = 1
+    for fr in frames:
+        for sp in fr.sprites:
+            h, w = sp.pixels.shape[:2]
+            amax = max(amax, h * w)
+            cx = sp.x + w / 2.0
+            cy = sp.y + h / 2.0
+            dmax = max(dmax, float(np.hypot(cx - px, cy - py)))
+    dmax = max(dmax, 1e-9)
+
+    wd = float(budget.weight_distance)
+    wa = float(budget.weight_area)
+    wsum = wd + float(budget.weight_frequency) + wa
+
+    def score_of(sp: SpriteObject) -> float:
+        """Weighted, per-sequence-normalized priority score in [0, 1]."""
+        h, w = sp.pixels.shape[:2]
+        cx = sp.x + w / 2.0
+        cy = sp.y + h / 2.0
+        dist_component = 1.0 - min(
+            float(np.hypot(cx - px, cy - py)) / dmax, 1.0
+        )
+        freq_component = seen_per_id.get(sp.id, 0) / fmax
+        area_component = (h * w) / amax
+        return (
+            wd * dist_component
+            + float(budget.weight_frequency) * freq_component
+            + wa * area_component
+        ) / wsum
+
+    t_start = time.perf_counter()
+
+    unrestricted: list = []
+    restricted: list = []
+    baked_backgrounds: list = []
+    all_allocations: list = []
+
+    total_sprite_frames = 0
+    demoted_sprite_frames = 0
+    lost_scanlines = 0
+    overflow_lines_total = 0
+    frames_with_drops = 0
+    perceptible_losses = 0
+    diff_pixel_total = 0
+    max_diff_fraction = 0.0
+
+    for fr in frames:
+        n_sp = len(fr.sprites)
+        total_sprite_frames += n_sp
+        keep_line: list = [None] * H          # line -> kept object indices
+        lost_by_obj: dict = {i: [] for i in range(n_sp)}
+        overflow_lines = 0
+        scored = [(score_of(sp), i, sp)
+                  for i, sp in enumerate(fr.sprites)]
+
+        if n_sp > budget.max_per_scanline:
+            # Line -> object indices that intersect it (sprite row on canvas).
+            line_objs: list = [[] for _ in range(H)]
+            for score, i, sp in scored:
+                top = max(0, sp.y)
+                bottom = min(H, sp.y + sp.pixels.shape[0])
+                for line in range(top, bottom):
+                    line_objs[line].append(i)
+
+            for line, objs in enumerate(line_objs):
+                if len(objs) <= budget.max_per_scanline:
+                    keep_line[line] = list(objs)
+                    continue
+                overflow_lines += 1
+                # Higher score wins; id then object order break ties
+                # deterministically (mirrors OAM-order hardware arbitration).
+                ranked = sorted(
+                    objs,
+                    key=lambda i: (
+                        -scored[i][0],
+                        scored[i][2].id,
+                        i,
+                    ),
+                )
+                kept = ranked[: budget.max_per_scanline]
+                keep_line[line] = kept
+                for i in ranked[budget.max_per_scanline:]:
+                    sp = scored[i][2]
+                    lost_by_obj[i].append(line - sp.y)
+        else:
+            # No line can overflow: every intersecting sprite is kept.
+            keep_line = None
+
+        # Restricted composite: bake each demoted sprite's lost strips into a
+        # copied background first, then draw only the kept strips via OAM.
+        bg = np.array(fr.background, copy=True)
+        allocations = []
+        frame_demoted = False
+        for i, sp in enumerate(fr.sprites):
+            lost = lost_by_obj[i]
+            score = scored[i][0]
+            if not lost:
+                allocations.append(
+                    FrameSpriteAllocation(sp.id, i, score, True, [], False)
+                )
+                continue
+            frame_demoted = True
+            lost_scanlines += len(lost)
+            mask = np.zeros(sp.pixels.shape[0], dtype=bool)
+            mask[np.asarray(lost, dtype=int)] = True
+            painted = _blit_sprite(bg, sp, mask, budget.background_palette)
+            if painted:
+                perceptible_losses += 1
+            allocations.append(
+                FrameSpriteAllocation(sp.id, i, score, False, list(lost),
+                                      bool(painted))
+            )
+
+        oam = np.array(bg, copy=True)
+        if keep_line is None:
+            for sp in fr.sprites:
+                _blit_sprite(oam, sp, None)
+        else:
+            # Draw only each sprite's kept strips; lines it lost stay as the
+            # palette-snapped background they were baked into above.
+            for i, sp in enumerate(fr.sprites):
+                h = sp.pixels.shape[0]
+                top = max(0, sp.y)
+                bottom = min(H, sp.y + h)
+                row_mask = np.zeros(h, dtype=bool)
+                for line in range(top, bottom):
+                    if i in keep_line[line]:
+                        row_mask[line - sp.y] = True
+                if row_mask.any():
+                    _blit_sprite(oam, sp, row_mask)
+
+        ref = _composite_unrestricted(fr)
+        diff = int(np.count_nonzero(np.any(oam != ref, axis=2)))
+        diff_pixel_total += diff
+        diff_fraction = diff / float(H * W)
+        max_diff_fraction = max(max_diff_fraction, diff_fraction)
+        if frame_demoted:
+            frames_with_drops += 1
+            demoted_sprite_frames += sum(1 for a in allocations if not a.kept)
+        overflow_lines_total += overflow_lines
+
+        unrestricted.append(ref)
+        restricted.append(oam)
+        baked_backgrounds.append(bg)
+        all_allocations.append(allocations)
+
+    elapsed = time.perf_counter() - t_start
+    canvas_pixels = H * W
+    stats = {
+        "frames": n_frames,
+        "max_per_scanline": budget.max_per_scanline,
+        "sprite_frame_instances": total_sprite_frames,
+        "frames_with_drops": frames_with_drops,
+        "frame_drop_rate": frames_with_drops / n_frames,
+        "demoted_sprite_frames": demoted_sprite_frames,
+        "perceptible_losses": perceptible_losses,
+        "lost_scanlines": lost_scanlines,
+        "overflow_scanlines": overflow_lines_total,
+        "diff_pixels_total": diff_pixel_total,
+        "mean_diff_fraction": diff_pixel_total / float(n_frames * canvas_pixels),
+        "max_diff_fraction": max_diff_fraction,
+        "allocation_seconds": elapsed,
+    }
+    return SpriteBudgetResult(
+        unrestricted=unrestricted,
+        restricted=restricted,
+        backgrounds=baked_backgrounds,
+        allocations=all_allocations,
+        stats=stats,
     )
